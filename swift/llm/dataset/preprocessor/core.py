@@ -20,7 +20,7 @@ DATASET_TYPE = Union[HfDataset, HfIterableDataset]
 
 logger = get_logger()
 
-_pair_keys = ['messages', 'images', 'videos', 'audios', 'tools', 'objects']
+_pair_keys = ['messages', 'images', 'videos', 'audios', 'points', 'tools', 'objects']
 
 
 class RowPreprocessor:
@@ -45,7 +45,8 @@ class RowPreprocessor:
         images_keys = ['images', 'image']
         audios_keys = ['audios', 'audio']
         videos_keys = ['videos', 'video']
-        for mm_type in ['images', 'audios', 'videos']:
+        points_keys = ['points', 'point']
+        for mm_type in ['images', 'audios', 'videos', 'points']:
             keys = locals()[f'{mm_type}_keys']
             for key in keys:
                 self.columns[key] = mm_type
@@ -91,7 +92,7 @@ class RowPreprocessor:
             elif isinstance(images, dict):
                 row[key] = [images]
 
-        for key in ['videos', 'audios']:
+        for key in ['videos', 'audios', 'points']:
             mm_data = row.get(key)
             if mm_data is None:
                 continue
@@ -265,6 +266,7 @@ class RowPreprocessor:
                 features['positive_messages'] = [messages_feature]
                 features['negative_messages'] = [messages_feature]
                 features['images'] = [{'bytes': Value(dtype='binary'), 'path': Value(dtype='string')}]
+                features['points'] = Sequence(feature=Sequence(feature=Value(dtype='float32'), length=-1), length=-1)
                 features['objects'] = {
                     'ref': Sequence(feature=Value(dtype='string'), length=-1),
                     'bbox': Sequence(feature=Sequence(feature=Value(dtype='float64'), length=-1), length=-1),
