@@ -1,2 +1,2 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-from . import llm, mllm
+from . import llm, mllm, point_cloud

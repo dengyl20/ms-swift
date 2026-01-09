@@ -598,7 +598,7 @@ register_template(
 
 class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
     version = 'omni_v2_5'
-    placeholder_tokens = ['<|IMAGE|>', '<|AUDIO|>', '<|VIDEO|>']
+    placeholder_tokens = ['<|IMAGE|>', '<|AUDIO|>', '<|VIDEO|>', '<|POINT|>']
 
     def init_processor(self, processor) -> None:
         if processor is None:
@@ -615,10 +615,15 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         self.use_audio_in_video = get_env_args('use_audio_in_video', bool, False)
         self.sampling_rate = get_env_args('sampling_rate', int, self.processor.feature_extractor.sampling_rate)
 
-    def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
+    def replace_tag(self, media_type: Literal['image', 'video', 'audio', 'point'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
         from qwen_omni_utils import fetch_image, fetch_video
-        if media_type == 'image':
+        if media_type == 'point':
+            if self.version == 'omni_v2_5':
+                return ['<|POINT|>']
+            elif self.version == 'omni_v3':
+                return ['<|point_pad|>']
+        elif media_type == 'image':
             inputs.images[index] = fetch_image({'image': inputs.images[index]})
             if self.version == 'omni_v2_5':
                 return ['<|vision_bos|><|IMAGE|><|vision_eos|>']
@@ -884,7 +889,7 @@ register_template(QwenTemplateMeta(MLLMTemplateType.qwen2_5_omni, template_cls=Q
 class Qwen3OmniTemplate(Qwen2_5OmniTemplate):
     version = 'omni_v3'
     norm_bbox = 'norm1000'
-    placeholder_tokens = ['<|image_pad|>', '<|audio_pad|>', '<|video_pad|>']
+    placeholder_tokens = ['<|image_pad|>', '<|audio_pad|>', '<|video_pad|>', '<|point_pad|>']
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
         return inputs
