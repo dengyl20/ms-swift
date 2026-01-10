@@ -7,7 +7,9 @@ from typing import Any, Dict, Iterable, List, Optional
 import numpy as np
 import torch
 from datasets import Dataset as HfDataset
+from datasets import Features
 from datasets import IterableDataset as HfIterableDataset
+from datasets import Sequence, Value
 from torch.utils.data import Dataset
 
 from swift.utils import get_logger
@@ -29,6 +31,7 @@ class ObjectPointCloudDataset(Dataset):
         conversation_types: Optional[Iterable[str]] = None,
         use_color: bool = True,
         normalize_pc: bool = True,
+        return_torch: bool = True,
         split_train_val: bool = False,
         split_ratio: float = 0.9,
         data_debug_num: int = 0,
@@ -41,6 +44,7 @@ class ObjectPointCloudDataset(Dataset):
         self.split = split
         self.use_color = bool(use_color)
         self.normalize_pc = bool(normalize_pc)
+        self.return_torch = bool(return_torch)
         self.split_train_val = bool(split_train_val)
         self.split_ratio = float(split_ratio)
         self.data_debug_num = int(data_debug_num)
@@ -128,11 +132,13 @@ class ObjectPointCloudDataset(Dataset):
         point_cloud = self._load_point_cloud(object_id)
         if self.normalize_pc:
             point_cloud = self.pc_norm(point_cloud)
-        point_cloud_tensor = torch.from_numpy(point_cloud.astype(np.float32, copy=False))
+        point_cloud = point_cloud.astype(np.float32, copy=False)
+        if self.return_torch:
+            point_cloud = torch.from_numpy(point_cloud)
         return {
             'object_id': object_id,
             'conversations': conversations,
-            'point_clouds': point_cloud_tensor,
+            'point_clouds': point_cloud,
         }
 
 
@@ -152,9 +158,54 @@ def _parse_pointcloud_kwargs(extra_args: List[str]) -> Dict[str, Any]:
     return kwargs
 
 
-def _iter_pointcloud_dataset(dataset: ObjectPointCloudDataset) -> Iterable[Dict[str, Any]]:
+def _iter_pointcloud_dataset(
+    dataset: ObjectPointCloudDataset,
+    *,
+    row_preprocessor: Optional['StreamingRowPreprocessor'] = None,
+) -> Iterable[Dict[str, Any]]:
     for idx in range(len(dataset)):
-        yield dataset[idx]
+        row = dataset[idx]
+        if row_preprocessor is not None:
+            row = row_preprocessor(row)
+            if row is None:
+                continue
+        yield row
+
+
+class StreamingRowPreprocessor:
+
+    def __init__(self) -> None:
+        self.messages_preprocessor = MessagesPreprocessor(
+            role_key='from',
+            content_key='value',
+            user_role='human',
+            assistant_role='gpt',
+        )
+
+    def __call__(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        item = {
+            'object_id': row['object_id'],
+            'messages': copy.deepcopy(row.get('conversations', [])),
+            'points': row['point_clouds'],
+        }
+        item = self.messages_preprocessor.preprocess(item)
+        if item is None:
+            return None
+        RowPreprocessor._check_messages(item)
+        RowPreprocessor._cast_mm_data(item)
+        return item
+
+
+def _build_streaming_features(pointnum: int, use_color: bool) -> Features:
+    channels = 6 if use_color else 3
+    return Features({
+        'object_id': Value('string'),
+        'messages': Sequence({
+            'role': Value('string'),
+            'content': Value('string'),
+        }),
+        'points': Sequence(Sequence(Value('float32'), length=channels), length=pointnum),
+    })
 
 
 def load_pointcloud_dataset(
@@ -181,22 +232,37 @@ def load_pointcloud_dataset(
     conversation_types = options.get('conversation_types')
     if conversation_types and ',' in conversation_types:
         conversation_types = [t for t in conversation_types.split(',') if t]
+    use_color = _parse_bool(options.get('use_color'), True)
+    pointnum = int(options.get('pointnum', 8192))
     dataset = ObjectPointCloudDataset(
         data_path=data_path,
         anno_path=anno_path,
-        pointnum=int(options.get('pointnum', 8192)),
+        pointnum=pointnum,
         split=options.get('split', 'train'),
         conversation_types=conversation_types,
-        use_color=_parse_bool(options.get('use_color'), True),
+        use_color=use_color,
         normalize_pc=_parse_bool(options.get('normalize_pc'), True),
+        return_torch=False,
         split_train_val=_parse_bool(options.get('split_train_val'), False),
         split_ratio=float(options.get('split_ratio', 0.9)),
         data_debug_num=int(options.get('data_debug_num', 0)),
     )
     if streaming:
-        dataset = HfIterableDataset.from_generator(_iter_pointcloud_dataset, gen_kwargs={'dataset': dataset})
-    else:
-        dataset = HfDataset.from_generator(_iter_pointcloud_dataset, gen_kwargs={'dataset': dataset})
+        features = _build_streaming_features(pointnum, use_color)
+        dataset = HfIterableDataset.from_generator(
+            _iter_pointcloud_dataset,
+            gen_kwargs={
+                'dataset': dataset,
+                'row_preprocessor': StreamingRowPreprocessor(),
+            },
+            features=features)
+        if columns:
+            dataset = RowPreprocessor.safe_rename_columns(dataset, columns)
+        if remove_unused_columns:
+            dataset = RowPreprocessor.remove_useless_columns(dataset)
+        return dataset
+
+    dataset = HfDataset.from_generator(_iter_pointcloud_dataset, gen_kwargs={'dataset': dataset})
 
     if columns:
         dataset = RowPreprocessor.safe_rename_columns(dataset, columns)

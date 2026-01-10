@@ -1,12 +1,22 @@
 from typing import List
+import os
 
 from swift.llm import load_dataset
 
 
 def _test_dataset(datasets: List[str], num_proc: int = 1, strict: bool = False, **kwargs):
-    dataset = load_dataset(datasets, num_proc=num_proc, strict=strict, **kwargs)
+    dataset = load_dataset(datasets, streaming=True, num_proc=num_proc, strict=strict, **kwargs)
+
     print(f'dataset[0]: {dataset[0]}')
-    print(f'dataset[1]: {dataset[1]}')
+
+    ds, _ = dataset
+
+    for i, example in enumerate(ds):
+        # example 是一个 dict，包含 'messages' / 'points'
+        print(i, example.keys())
+        if i >= 9:
+            break
+
 
 
 def test_sft():
@@ -17,8 +27,7 @@ def test_sft():
     # _test_dataset(['OmniData/Zhihu-KOL-More-Than-100-Upvotes'])
     # _test_dataset(['OmniData/Zhihu-KOL'])
     _test_dataset([
-        'AI-ModelScope/alpaca-gpt4-data-zh#1000', 'AI-ModelScope/alpaca-gpt4-data-en#1000',
-        'AI-ModelScope/LongAlpaca-12k#1000'
+        'pointllm_point_cloud'
     ])
     # _test_dataset(['swift/Infinity-Instruct:all'])
     # _test_dataset(['swift/sharegpt:all'])
@@ -80,11 +89,16 @@ def test_cls():
 
 
 if __name__ == '__main__':
-    # test_sft()
+    # 1) 设置 env（你的 load_pointcloud_dataset 支持 env 获取路径）
+    DATA_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/8192_npy"
+    ANNO_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K.json"
+    os.environ["POINT_CLOUD_DATA_PATH"] = DATA_PATH
+    os.environ["POINT_CLOUD_ANNO_PATH"] = ANNO_PATH
+    test_sft()
     # test_agent()
     # test_dpo()
     # test_kto()
-    test_mllm()
+    # test_mllm()
     # test_pretrain()
     # test_dataset_info()
     # test_cls()
