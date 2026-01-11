@@ -24,6 +24,15 @@ from typing import Dict, Any, Optional, Tuple, Iterable, List, Type, Union
 import torch
 import torch.nn as nn
 
+from swift.llm.model.point_cloud.visual_utils import (
+    _print_param_table,
+    _collect_state_rows,
+    _build_key_tree,
+    _compare_state_dicts,
+    _print_key_tree,
+    _print_diff_report,
+)
+
 
 # -----------------------------
 # Basic utilities
@@ -461,7 +470,7 @@ class PointBERTConfig:
     num_group: int = 512
     group_size: int = 32
     point_dims: int = 6        # XYZRGB
-    encoder_dims: int = 1024   # local encoder output dim
+    encoder_dims: int = 256   # local encoder output dim
 
     # Optional (kept for parity, not used directly)
     cls_dim: int = 0
@@ -533,26 +542,22 @@ class PointBERTEncoder(nn.Module):
         map_location: str = "cpu",
         weights_only: Optional[bool] = None,
         verbose: bool = True,
+        # ---- new knobs ----
+        print_structures: bool = False,
+        print_key_tree: bool = False,
+        max_rows: Optional[int] = None,        # None => print all tensors
+        tree_max_depth: Optional[int] = None,  # None => no depth limit
+        check_dtype: bool = False,
     ) -> Dict[str, Any]:
         """
-        Load pretrained weights into this encoder.
+        Load pretrained weights into this encoder, with rich structure printing and diff.
 
-        This tries to reuse PointLLM/PointBERT checkpoints which commonly store parameters under:
-            - "state_dict" key
-            - with prefix "module.point_encoder."
-
-        Args:
-            ckpt_path: path to .pth/.pt checkpoint.
-            prefixes: prefixes to attempt for selecting/stripping keys.
-            strict: passed to load_state_dict.
-            map_location: torch.load map_location.
-            verbose: print missing/unexpected keys.
-
-        Returns:
-            dict with keys: missing_keys, unexpected_keys, loaded_keys
+        Added:
+        - prints checkpoint "structure" (key tree + param table)
+        - prints current model structure (repr + param table + key tree)
+        - compares checkpoint vs model (missing/unexpected/shape mismatch[/dtype mismatch])
         """
-        # Prefer safe weight-only loading when supported (PyTorch >= 2.0),
-        # but fall back to regular torch.load for older versions or custom checkpoints.
+        # ---- load checkpoint ----
         if weights_only is None:
             try:
                 ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=True)
@@ -567,36 +572,80 @@ class PointBERTEncoder(nn.Module):
                 ckpt = torch.load(ckpt_path, map_location=map_location)
 
         raw_state = _as_state_dict(ckpt)
-
         state = _select_and_strip_prefixes(raw_state, prefixes or ())
 
+        # ---- build model state ----
+        model_state = self.state_dict()
+
+        # ---- print structures (before loading) ----
+        if print_structures:
+            print(f"\n#############################")
+            print(f"# Checkpoint: {ckpt_path}")
+            print(f"#############################")
+
+            # checkpoint
+            ckpt_rows = _collect_state_rows(state)
+            _print_param_table(ckpt_rows, title="Checkpoint tensors (selected + stripped)", max_rows=max_rows)
+            if print_key_tree:
+                ckpt_tree = _build_key_tree([r["name"] for r in ckpt_rows])
+                _print_key_tree(
+                    ckpt_tree,
+                    title="Checkpoint",
+                    state=state,
+                    max_depth=tree_max_depth,
+                )
+
+            print(f"\n#############################")
+            print(f"# Current model: {self.__class__.__name__}")
+            print(f"#############################")
+            print("\n=== Current model (nn.Module repr) ===")
+            print(self)
+
+            model_rows = _collect_state_rows(model_state)
+            _print_param_table(model_rows, title="Current model tensors (state_dict)", max_rows=max_rows)
+            if print_key_tree:
+                model_tree = _build_key_tree([r["name"] for r in model_rows])
+                _print_key_tree(
+                    model_tree,
+                    title="Current model",
+                    state=model_state,
+                    max_depth=tree_max_depth,
+                )
+
+            # diff report (checkpoint vs model)
+            diff = _compare_state_dicts(state, model_state, check_dtype=check_dtype)
+            _print_diff_report(diff, title="Checkpoint vs Current model", max_list=80)
+
+        # ---- actual load ----
         incompatible = self.load_state_dict(state, strict=strict)
 
         missing = list(incompatible.missing_keys)
         unexpected = list(incompatible.unexpected_keys)
         loaded_keys = [k for k in state.keys() if k in self.state_dict().keys()]
 
+        # ---- legacy verbose output (keep for parity) ----
         if verbose:
             if missing:
-                print(f"[PointBERTEncoder] Missing keys ({len(missing)}):")
+                print(f"\n[PointBERTEncoder] Missing keys reported by load_state_dict ({len(missing)}):")
                 for k in missing[:50]:
                     print("  -", k)
                 if len(missing) > 50:
                     print(f"  ... ({len(missing)-50} more)")
             if unexpected:
-                print(f"[PointBERTEncoder] Unexpected keys ({len(unexpected)}):")
+                print(f"\n[PointBERTEncoder] Unexpected keys reported by load_state_dict ({len(unexpected)}):")
                 for k in unexpected[:50]:
                     print("  -", k)
                 if len(unexpected) > 50:
                     print(f"  ... ({len(unexpected)-50} more)")
             if not missing and not unexpected:
-                print(f"[PointBERTEncoder] Successfully loaded weights from: {ckpt_path}")
+                print(f"\n[PointBERTEncoder] Successfully loaded weights from: {ckpt_path}")
 
         return {
             "missing_keys": missing,
             "unexpected_keys": unexpected,
             "loaded_keys": loaded_keys,
         }
+
 
     def forward(self, points: torch.Tensor, *, return_tokens: Optional[bool] = None) -> torch.Tensor:
         """

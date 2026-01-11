@@ -30,10 +30,10 @@ def load_and_tokenize(ms_model_id, template):
     from swift.llm import EncodePreprocessor, get_model_tokenizer, get_template
     try:
         vl_fields = ['vl', 'video', 'minicpmv', 'llava', 'vision', 'emu', 'florence']
-        model_ins, tokenizer = get_model_tokenizer(ms_model_id, load_model='mplug' in ms_model_id.lower())
+        model_ins, tokenizer = get_model_tokenizer(ms_model_id, load_model='mplug' in ms_model_id.lower(), use_hf=True, download_model=False)
         template_ins = get_template(template, tokenizer)
         if template_ins.use_model:
-            model_ins, _ = get_model_tokenizer(ms_model_id, load_model=True)
+            model_ins, _ = get_model_tokenizer(ms_model_id, load_model=True, use_hf=True, download_model=False)
             template_ins.model = model_ins
         template_ins.set_mode('train')
         if 'audio' in template_ins.__class__.__name__.lower():
@@ -113,16 +113,18 @@ def load_and_tokenize_old(ms_model_id, template):
 
 
 if __name__ == '__main__':
+
+    import swift.register.point_cloud_register 
     parser = argparse.ArgumentParser()
     parser.add_argument(
         '--ms_model_id',
         type=str,
-        required=True,
+        default='Qwen/Qwen3-Omni-30B-A3B-Instruct',
     )
     parser.add_argument(
         '--template',
         type=str,
-        required=True,
+        default='my_qwen3_omni_point',
     )
     parser.add_argument('--new', type=str, required=False, default='1')
     args = parser.parse_args()

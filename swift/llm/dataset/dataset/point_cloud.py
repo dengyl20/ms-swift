@@ -200,10 +200,11 @@ def _build_streaming_features(pointnum: int, use_color: bool) -> Features:
     channels = 6 if use_color else 3
     return Features({
         'object_id': Value('string'),
-        'messages': Sequence({
+        # 关键修改：用 python list 表示 list-of-struct
+        'messages': [{
             'role': Value('string'),
             'content': Value('string'),
-        }),
+        }],
         'points': Sequence(Sequence(Value('float32'), length=channels), length=pointnum),
     })
 
@@ -214,7 +215,7 @@ def load_pointcloud_dataset(
     *,
     num_proc: int = 1,
     load_from_cache_file: bool = True,
-    streaming: bool = False,
+    streaming: bool = True,
     strict: bool = False,
     columns: Optional[Dict[str, str]] = None,
     remove_unused_columns: bool = True,

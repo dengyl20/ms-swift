@@ -1,5 +1,6 @@
 from typing import List
 import os
+from rich.pretty import pprint
 
 from swift.llm import load_dataset
 
@@ -13,7 +14,10 @@ def _test_dataset(datasets: List[str], num_proc: int = 1, strict: bool = False, 
 
     for i, example in enumerate(ds):
         # example 是一个 dict，包含 'messages' / 'points'
-        print(i, example.keys())
+        # pprint(i, example.keys())
+        pprint(example['points'])
+        pprint(example['messages'])
+        
         if i >= 9:
             break
 

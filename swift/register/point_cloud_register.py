@@ -16,6 +16,10 @@ from swift.llm.template.template.qwen import Qwen3OmniTemplate, QwenTemplateMeta
 from swift.utils import get_env_args
 
 
+from rich.pretty import pprint
+from torchinfo import summary
+
+
 register_model_arch(
     MultiModelKeys(
         'my_qwen3_omni_point',
@@ -44,27 +48,14 @@ class PointCloudProjector(nn.Module):
 
 
 def _normalize_points(points: Any, batch_size: int) -> List[List[torch.Tensor]]:
-    if points is None:
-        return []
-    if torch.is_tensor(points):
-        if points.ndim != 3:
-            raise ValueError(f'Expected points shape (B,N,C), got {tuple(points.shape)}')
-        if points.shape[0] != batch_size:
-            raise ValueError(f'Points batch size {points.shape[0]} != input batch size {batch_size}')
-        return [[points[i]] for i in range(points.shape[0])]
-    if isinstance(points, (list, tuple)):
-        normalized: List[List[torch.Tensor]] = []
-        for item in points:
-            if torch.is_tensor(item):
-                normalized.append([item])
-            elif isinstance(item, (list, tuple)):
-                normalized.append(list(item))
-            else:
-                raise TypeError(f'Unsupported point item type: {type(item)}')
-        if len(normalized) != batch_size:
-            raise ValueError(f'Points batch size {len(normalized)} != input batch size {batch_size}')
-        return normalized
-    raise TypeError(f'Unsupported points type: {type(points)}')
+    # points: List[B][T][N][C], leaf: float
+    # Keep first two dims as lists; convert each (N, C) to a tensor.
+    assert isinstance(points, list) and len(points) == batch_size
+
+    return [
+        [torch.tensor(p_bt) for p_bt in points[b]]
+        for b in range(batch_size)
+    ]
 
 
 def _encode_point_clouds(
@@ -111,6 +102,7 @@ def _apply_point_embeddings(
         dtype=encoder_dtype,
     )
     point_features = point_features.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+    # import ipdb; ipdb.set_trace()
 
     offset = 0
     for i, sample_points in enumerate(point_batches):
