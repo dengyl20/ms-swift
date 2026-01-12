@@ -91,11 +91,11 @@ train:
   pin_memory: true
   drop_last: true
 
-  epochs: 5
-  steps_per_epoch: 50000   # streaming 没有 len(dataset)，用 steps 控制每个 epoch 训练多少步
-  val_steps: 300          # 每个 epoch 跑多少个验证 batch（建议小一些）
+  epochs: 1
+  steps_per_epoch: 6250   # streaming 没有 len(dataset)，用 steps 控制每个 epoch 训练多少步
+  val_steps: 150          # 每个 epoch 跑多少个验证 batch（建议小一些）
 
-  lr: 0.0002
+  lr: 0.001
   weight_decay: 0.05
   betas: [0.9, 0.95]
   grad_clip: 1.0

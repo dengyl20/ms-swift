@@ -4,7 +4,6 @@ import hashlib
 from typing import Any, Dict, Iterator, Optional
 
 import numpy as np
-import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from swift.llm import load_dataset
@@ -18,9 +17,6 @@ def _stable_hash_to_unit_interval(x: Any) -> float:
 
 
 def extract_assistant_caption(messages: Any, join: str = "all") -> Optional[str]:
-    """
-    从 messages 中提取所有 role=assistant 的 content，并按 join 策略合并。
-    """
     if not isinstance(messages, list):
         return None
 
@@ -45,14 +41,10 @@ def extract_assistant_caption(messages: Any, join: str = "all") -> Optional[str]
 
 class SwiftPointTextStreamingDataset(IterableDataset):
     """
-    以 streaming 方式从 swift dataset 读取:
-      - points: list[list[float]] (8192,6)
-      - messages: list[dict]
-    产出:
-      dict(object_id, points_np, caption)
+    Streaming dataset wrapper with DDP rank/world_size sharding + dataloader worker sharding.
 
-    注意：这里只做“轻量过滤 + 文本提取 + train/val 切分”；
-         不在 Dataset 内做 point encoder / text embedding（避免多进程重复加载大模型）。
+    输出:
+      dict(object_id, points(np.float32)[8192,6], caption(str))
     """
 
     def __init__(
@@ -67,6 +59,9 @@ class SwiftPointTextStreamingDataset(IterableDataset):
         split: str = "train",          # "train" or "val"
         val_ratio: float = 0.01,
         max_samples: Optional[int] = None,
+        # ---- new: ddp sharding ----
+        rank: int = 0,
+        world_size: int = 1,
     ):
         super().__init__()
         self.dataset_name_or_path = str(dataset_name_or_path)
@@ -79,7 +74,10 @@ class SwiftPointTextStreamingDataset(IterableDataset):
         self.val_ratio = float(val_ratio)
         self.max_samples = max_samples if max_samples is None else int(max_samples)
 
-        self._epoch = 0  # allow set_epoch for different shuffle each epoch
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+
+        self._epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
@@ -94,7 +92,6 @@ class SwiftPointTextStreamingDataset(IterableDataset):
 
         # streaming shuffle (if supported)
         if self.shuffle_buffer > 0 and hasattr(ds, "shuffle"):
-            # 让每个 epoch 的顺序不同（如果 ds.shuffle 支持 seed）
             try:
                 ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed + self._epoch)
             except TypeError:
@@ -105,27 +102,40 @@ class SwiftPointTextStreamingDataset(IterableDataset):
     def _is_val(self, object_id: Any) -> bool:
         if self.val_ratio <= 0.0:
             return False
-        u = _stable_hash_to_unit_interval(object_id)
-        return u < self.val_ratio
+        return _stable_hash_to_unit_interval(object_id) < self.val_ratio
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         ds = self._build_swift_iterable()
 
-        # 多 worker 去重：优先用 shard（如果支持）
         worker = get_worker_info()
-        if worker is not None:
-            if hasattr(ds, "shard"):
-                try:
-                    ds = ds.shard(num_shards=worker.num_workers, index=worker.id)
-                except TypeError:
-                    # fallback：下面手动跳过
-                    pass
+        num_workers = worker.num_workers if worker is not None else 1
+        worker_id = worker.id if worker is not None else 0
+
+        # ---- combined sharding index ----
+        # total_shards = world_size * num_workers
+        # shard_index  = rank * num_workers + worker_id
+        total_shards = max(1, self.world_size) * max(1, num_workers)
+        shard_index = max(0, self.rank) * max(1, num_workers) + worker_id
+
+        # Prefer HF native shard() only when the underlying IterableDataset has
+        # enough *data sources* (n_shards). For generator-based datasets
+        # (IterableDataset.from_generator), n_shards is typically 1.
+        # Calling ds.shard(num_shards>n_shards, index>0) can raise IndexError
+        # inside HF sharding utils (empty gen_kwargs_list). In that case, we
+        # fall back to manual example-level sharding (idx % total_shards).
+        used_native_shard = False
+        # if total_shards > 1 and hasattr(ds, "shard"):
+        #     try:
+        #         ds = ds.shard(num_shards=total_shards, index=shard_index)
+        #         used_native_shard = True
+        #     except TypeError:
+        #         used_native_shard = False
 
         yielded = 0
         for idx, ex in enumerate(ds):
-            # 手动 worker 分片（当 ds 不支持 shard 时）
-            if worker is not None and (not hasattr(ds, "shard")):
-                if (idx % worker.num_workers) != worker.id:
+            # Manual fallback sharding when ds.shard is not available
+            if (not used_native_shard) and total_shards > 1:
+                if (idx % total_shards) != shard_index:
                     continue
 
             if self.max_samples is not None and yielded >= self.max_samples:
@@ -149,7 +159,6 @@ class SwiftPointTextStreamingDataset(IterableDataset):
             if points is None:
                 continue
 
-            # points: list[list[float]] => np.float32 (8192,6)
             try:
                 pts = np.asarray(points, dtype=np.float32)
             except Exception:
@@ -157,13 +166,12 @@ class SwiftPointTextStreamingDataset(IterableDataset):
 
             if pts.ndim != 2 or pts.shape[1] != 6:
                 continue
-            # 你给的样例是 (8192,6)；若存在长度不等，建议直接跳过（或自行补齐/采样）
             if pts.shape[0] != 8192:
                 continue
 
             yielded += 1
             yield {
                 "object_id": object_id,
-                "points": pts,     # numpy float32 (8192,6)
+                "points": pts,
                 "caption": caption,
             }

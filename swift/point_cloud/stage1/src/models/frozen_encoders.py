@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import gc
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -111,6 +112,8 @@ class FrozenQwenEmbeddingTable(nn.Module):
                 self.tokenizer.pad_token = self.tokenizer.convert_ids_to_tokens(0)
 
         extract_and_discard = bool(cfg.get("extract_embedding_and_discard_model", True))
+        if not extract_and_discard:
+            raise ValueError("For VRAM safety, set extract_embedding_and_discard_model=true.")
 
         # 1) 加载全模型 -> 2) 提取 embedding weight -> 3) 可选丢弃全模型仅保留 nn.Embedding
         model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
@@ -118,32 +121,34 @@ class FrozenQwenEmbeddingTable(nn.Module):
             trust_remote_code=trust_remote_code,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
-            device_map="auto",  # 不强依赖 accelerate
+            device_map="cpu",  # 不强依赖 accelerate
         )
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
 
         emb_layer = model.get_input_embeddings()
-        weight = emb_layer.weight.detach().clone()  # clone: 允许 del model 后仍保留权重
 
-        if extract_and_discard:
-            del model
-            # 注意：这里只释放 Python 引用；如在 CUDA 上加载过，可额外 empty_cache
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # ----------- 关键修改：把 weight 留在 CPU 上 -----------
+        weight_cpu = emb_layer.weight.detach().to("cpu").clone()
 
-            self.embed = nn.Embedding.from_pretrained(weight, freeze=True)
-        else:
-            # 保留原模型 embedding（仍然不训练）
-            self.embed = emb_layer
+        self.hidden_size = int(weight_cpu.shape[1])
 
-        self.embed.to(device)
+        # 显式删除引用，确保原模型/emb_layer 不再持有任何 tensor
+        del emb_layer
+        del model
+        gc.collect()
+
+        # 现在 GPU 上根本不应该有这次加载占用的显存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+        # 最后只把 embedding table 放到训练 device
+        self.embed = nn.Embedding.from_pretrained(weight_cpu, freeze=True).to(self.device)
         self.embed.eval()
         for p in self.embed.parameters():
             p.requires_grad = False
-
-        self.hidden_size = int(weight.shape[1])
 
     @torch.no_grad()
     def forward(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
