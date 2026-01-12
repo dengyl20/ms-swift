@@ -107,34 +107,37 @@ def main() -> None:
     os.environ['POINT_CLOUD_ANNO_PATH'] = args.anno_path
 
     dataset = load_dataset([args.dataset], seed=42, streaming=True, remove_unused_columns=False)[0]
-    for _, ex in enumerate(dataset):
+    for idx, ex in enumerate(dataset):
         sample = ex
-        break
+        print(sample['messages'][1]['content'])
+        print(len(sample['messages'][1]['content']))
+        if idx > 30:
+            break
 
-    print('=== Input ===')
-    # import ipdb; ipdb.set_trace()
+    # print('=== Input ===')
+    # # import ipdb; ipdb.set_trace()
+    # print(sample.keys())
+    # print(sample['messages'])
 
-    print(sample['messages'])
+    # engine = PtEngine(
+    #     args.model_id,
+    #     model_type=args.model_type,
+    #     attn_impl=args.attn_impl,
+    #     device_map=args.device_map,
+    #     use_hf=True,
+    #     download_model=False,
+    # )
 
-    engine = PtEngine(
-        args.model_id,
-        model_type=args.model_type,
-        attn_impl=args.attn_impl,
-        device_map=args.device_map,
-        use_hf=True,
-        download_model=False,
-    )
+    # _load_point_encoder_weights(engine.model, args.point_bert_ckpt)
 
-    _load_point_encoder_weights(engine.model, args.point_bert_ckpt)
+    # infer_request = InferRequest(messages=sample['messages'], points=[sample['points']])
+    # request_config = RequestConfig(max_tokens=args.max_tokens, temperature=args.temperature)
+    # responses = engine.infer([infer_request], request_config)
 
-    infer_request = InferRequest(messages=sample['messages'], points=[sample['points']])
-    request_config = RequestConfig(max_tokens=args.max_tokens, temperature=args.temperature)
-    responses = engine.infer([infer_request], request_config)
+    # response = responses[0].choices[0].message.content
 
-    response = responses[0].choices[0].message.content
-
-    print('=== Output ===')
-    print(response)
+    # print('=== Output ===')
+    # print(response)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,110 @@
+seed: 42
+
+data:
+  swift:
+    dataset: "pointllm_point_cloud"  # 例如: "my_point_dataset"
+    seed: 42
+    streaming: true
+    remove_unused_columns: false
+
+    # 是否在 streaming dataset 上做 buffer shuffle（若数据集对象支持 .shuffle）
+    shuffle_buffer: 0   # 0 表示不 shuffle
+
+    # 取 messages 中 role=assistant 的 content 作为 caption
+    assistant_join: "last"   # "all"：拼接所有 assistant；"last"：只取最后一个 assistant
+
+    # 不需要预先划分文件：用 object_id 做稳定 hash 分割 train/val
+    val_ratio: 0.01         # 1% 做验证
+
+    # 调试用：限制样本数（None 表示不限制）
+    max_samples: null
+
+  text:
+    max_text_len: 128
+    add_special_tokens: false   # 是否给 tokenizer 加 BOS/EOS 等 special tokens（通常 caption embedding 不加更贴近你的描述）
+
+external_encoders:
+  point_bert:
+    ckpt_path: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM_7B_v1.1_init/point_bert_v1.2.pt"
+    return_tokens: true
+    drop_cls: false                 # True => x[:,1:] => (B,512,trans_dim)
+    input_dtype: "fp32"            # "fp32" 更稳；如确定可用可改 "fp16"
+
+    # 注意：必须与你的 checkpoint 匹配
+    config:
+      trans_dim: 384
+      depth: 12
+      num_heads: 8
+      drop_path_rate: 0.1
+      mlp_ratio: 4.0
+
+      num_group: 512
+      group_size: 32
+      point_dims: 6
+      encoder_dims: 256
+
+  qwen:
+    model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    tokenizer_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    trust_remote_code: true
+
+    torch_dtype: "fp16"  # "fp16" | "bf16" | "fp32"
+    extract_embedding_and_discard_model: true  # 仅保留 embedding table，释放大模型其余参数
+
+    max_text_len: 128
+    add_special_tokens: false
+
+model:
+  # 这两个必须与外部 encoder 输出一致
+  d_text_in: 2048
+  d_point_in: 384         # = point_bert.config.trans_dim
+  point_tokens: 513       # = point_bert.config.num_group (drop_cls=True 时)
+
+  max_text_len: 128
+
+  # 统一表征空间的内部维度
+  d_model: 512
+  num_latents: 32
+
+  resampler_depth: 2
+  decoder_depth: 6
+
+  heads: 8
+  ff_mult: 4
+  dropout: 0.1
+
+  use_point_pos_emb: true
+  use_text_pos_emb: true
+
+loss:
+  w_text_recon: 1.0
+  w_point2text_recon: 1.0
+  w_align: 0.1
+
+  recon_mse: 1.0
+  recon_cos: 0.1
+  align_type: "cosine"  # "cosine" or "mse"
+
+train:
+  batch_size: 128
+  num_workers: 1
+  pin_memory: true
+  drop_last: true
+
+  epochs: 5
+  steps_per_epoch: 50000   # streaming 没有 len(dataset)，用 steps 控制每个 epoch 训练多少步
+  val_steps: 300          # 每个 epoch 跑多少个验证 batch（建议小一些）
+
+  lr: 0.0002
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+
+  amp: true
+  log_every: 50
+
+  save_dir: "checkpoints/unified_ae_swift"
+
+  scheduler:
+    type: "cosine"
+    warmup_steps: 2000

@@ -1,3 +1,7 @@
+# Added
+*.npz
+
+
 # Byte-compiled / optimized / DLL files
 tmp
 *.ttf
