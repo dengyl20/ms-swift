@@ -1,6 +1,7 @@
 # Added
 *.npz
 checkpoints/
+data_features/
 
 # Byte-compiled / optimized / DLL files
 tmp
