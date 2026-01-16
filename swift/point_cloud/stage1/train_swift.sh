@@ -12,5 +12,5 @@ export MIOPEN_DISABLE_CACHE=1
 
 
 # 4) 运行你的训练
-torchrun --standalone --nproc_per_node=8  -m swift.point_cloud.stage1.train_swift_mod
+torchrun --standalone --nproc_per_node=8  -m swift.point_cloud.stage1.train_swift
 

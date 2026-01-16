@@ -28,7 +28,7 @@ from rich.progress import (
 # === 修改点：替换为新数据集 ===
 from swift.point_cloud.stage1.src.data.feature_dataset import ProcessedPointTextFeatureDataset
 
-# === 保持不变：loss / model / utils ===
+# === 修改点：loss / model / utils ===
 from swift.point_cloud.stage1.src.models.losses import latent_align_loss, masked_cosine_distance, masked_mse
 from swift.point_cloud.stage1.src.models.unified_ae import UnifiedPointTextAE
 from swift.point_cloud.stage1.src.utils.common import make_warmup_cosine_lambda, set_global_seed, load_yaml
@@ -121,6 +121,7 @@ def sync_meters_across_ranks(meters: Dict[str, AverageMeter], device: torch.devi
 # =========================
 # 新增：feature 数据集辅助逻辑
 # =========================
+
 
 def _stable_hash_to_unit_interval_bytes(b: bytes) -> float:
     """
@@ -236,12 +237,14 @@ def run_validation(
     model.eval()
 
     loss_cfg = cfg["loss"]
-    meters = {k: AverageMeter() for k in ["total", "text_recon", "point2text_recon", "align"]}
+    meters = {k: AverageMeter() for k in ["total", "text_recon", "point2text_recon", "point_recon", "contrastive"]}
 
     for step, batch in enumerate(val_loader):
         if not batch:
-            raise RuntimeError(f"Empty batch on rank={rank} step={step}. "
-                            f"This will desync DDP. Fix dataset/collate/filtering.")
+            raise RuntimeError(
+                f"Empty batch on rank={rank} step={step}. "
+                f"This will desync DDP. Fix dataset/collate/filtering."
+            )
 
         point_feat = batch["point_tokens"].to(device, non_blocking=True)
         text_feat = batch["text_embeds"].to(device, non_blocking=True)
@@ -266,19 +269,32 @@ def run_validation(
                 loss_cfg["recon_mse"] * masked_mse(out["text_recon_from_point"], text_feat, text_mask)
                 + loss_cfg["recon_cos"] * masked_cosine_distance(out["text_recon_from_point"], text_feat, text_mask)
             )
-            align = latent_align_loss(out["text_latents"], out["point_latents"], align_type=loss_cfg["align_type"])
+            p2p = (
+                loss_cfg["recon_mse"] * masked_mse(out["point_recon"], point_feat, mask=None)
+                + loss_cfg["recon_cos"] * masked_cosine_distance(out["point_recon"], point_feat, mask=None)
+            )
+
+            contrastive = latent_align_loss(
+                out["text_latents"],
+                out["point_latents"],
+                align_type=loss_cfg.get("align_type", "contrastive"),
+                temperature=float(loss_cfg.get("contrastive_temperature", 0.07)),
+                gather_distributed=bool(loss_cfg.get("contrastive_gather", True)),
+            )
 
             total = (
                 loss_cfg["w_text_recon"] * text_recon
                 + loss_cfg["w_point2text_recon"] * p2t
-                + loss_cfg["w_align"] * align
+                + float(loss_cfg.get("w_point_recon", 0.0)) * p2p
+                + loss_cfg["w_align"] * contrastive
             )
 
         bs = point_feat.size(0)
         meters["total"].update(total.item(), bs)
         meters["text_recon"].update(text_recon.item(), bs)
         meters["point2text_recon"].update(p2t.item(), bs)
-        meters["align"].update(align.item(), bs)
+        meters["point_recon"].update(p2p.item(), bs)
+        meters["contrastive"].update(contrastive.item(), bs)
 
         # progress bar：只在 rank0 更新
         if progress is not None and task_id is not None and rank == 0:
@@ -288,7 +304,8 @@ def run_validation(
                 loss=meters["total"].avg,
                 text=meters["text_recon"].avg,
                 p2t=meters["point2text_recon"].avg,
-                align=meters["align"].avg,
+                p2p=meters["point_recon"].avg,
+                itc=meters["contrastive"].avg,
             )
 
     # all_reduce 得到全局验证均值
@@ -312,7 +329,9 @@ def main():
     set_global_seed(base_seed + rank)
 
     if is_main_process(rank):
-        console.print(f"[bold]DDP[/bold]: enabled={ddp_is_enabled()}  world_size={world_size}  rank={rank}  local_rank={local_rank}")
+        console.print(
+            f"[bold]DDP[/bold]: enabled={ddp_is_enabled()}  world_size={world_size}  rank={rank}  local_rank={local_rank}"
+        )
         console.print(f"[bold]device[/bold]: {device}")
 
     # -------------------------
@@ -414,13 +433,19 @@ def main():
     meta_D = int(s0["point"]["trans_dim"])
 
     if meta_max_len != int(mcfg["max_text_len"]):
-        raise ValueError(f"Mismatch: dataset text.max_len={meta_max_len} vs model.max_text_len={int(mcfg['max_text_len'])}")
+        raise ValueError(
+            f"Mismatch: dataset text.max_len={meta_max_len} vs model.max_text_len={int(mcfg['max_text_len'])}"
+        )
     if meta_hidden != int(mcfg["d_text_in"]):
-        raise ValueError(f"Mismatch: dataset text.hidden={meta_hidden} vs model.d_text_in={int(mcfg['d_text_in'])}")
+        raise ValueError(
+            f"Mismatch: dataset text.hidden={meta_hidden} vs model.d_text_in={int(mcfg['d_text_in'])}"
+        )
     if meta_G != int(mcfg["point_tokens"]):
         raise ValueError(f"Mismatch: dataset point.num_tokens={meta_G} vs model.point_tokens={int(mcfg['point_tokens'])}")
     if meta_D != int(mcfg["d_point_in"]):
-        raise ValueError(f"Mismatch: dataset point.trans_dim={meta_D} vs model.d_point_in={int(mcfg['d_point_in'])}")
+        raise ValueError(
+            f"Mismatch: dataset point.trans_dim={meta_D} vs model.d_point_in={int(mcfg['d_point_in'])}"
+        )
 
     # -------------------------
     # 2) build trainable mapping model (+ DDP)
@@ -478,7 +503,8 @@ def main():
             TextColumn("loss={task.fields[loss]:.4f}"),
             TextColumn("text={task.fields[text]:.4f}"),
             TextColumn("p2t={task.fields[p2t]:.4f}"),
-            TextColumn("align={task.fields[align]:.4f}"),
+            TextColumn("p2p={task.fields[p2p]:.4f}"),
+            TextColumn("itc={task.fields[itc]:.4f}"),
             console=console,
             transient=False,
         )
@@ -499,7 +525,7 @@ def main():
             # set train mode
             model.train()
 
-            meters = {k: AverageMeter() for k in ["total", "text_recon", "point2text_recon", "align"]}
+            meters = {k: AverageMeter() for k in ["total", "text_recon", "point2text_recon", "point_recon", "contrastive"]}
 
             train_task_id = None
             if progress is not None:
@@ -510,13 +536,16 @@ def main():
                     loss=0.0,
                     text=0.0,
                     p2t=0.0,
-                    align=0.0,
+                    p2p=0.0,
+                    itc=0.0,
                 )
 
             for step, batch in enumerate(train_loader):
                 if not batch:
-                    raise RuntimeError(f"Empty batch on rank={rank} epoch={epoch} step={step}. "
-                                    f"This will desync DDP. Fix dataset/collate/filtering.")
+                    raise RuntimeError(
+                        f"Empty batch on rank={rank} epoch={epoch} step={step}. "
+                        f"This will desync DDP. Fix dataset/collate/filtering."
+                    )
 
                 point_feat = batch["point_tokens"].to(device, non_blocking=True)
                 text_feat = batch["text_embeds"].to(device, non_blocking=True)
@@ -541,12 +570,24 @@ def main():
                         loss_cfg["recon_mse"] * masked_mse(out["text_recon_from_point"], text_feat, text_mask)
                         + loss_cfg["recon_cos"] * masked_cosine_distance(out["text_recon_from_point"], text_feat, text_mask)
                     )
-                    align = latent_align_loss(out["text_latents"], out["point_latents"], align_type=loss_cfg["align_type"])
+                    p2p = (
+                        loss_cfg["recon_mse"] * masked_mse(out["point_recon"], point_feat, mask=None)
+                        + loss_cfg["recon_cos"] * masked_cosine_distance(out["point_recon"], point_feat, mask=None)
+                    )
+
+                    contrastive = latent_align_loss(
+                        out["text_latents"],
+                        out["point_latents"],
+                        align_type=loss_cfg.get("align_type", "contrastive"),
+                        temperature=float(loss_cfg.get("contrastive_temperature", 0.07)),
+                        gather_distributed=bool(loss_cfg.get("contrastive_gather", True)),
+                    )
 
                     total = (
                         loss_cfg["w_text_recon"] * text_recon
                         + loss_cfg["w_point2text_recon"] * p2t
-                        + loss_cfg["w_align"] * align
+                        + float(loss_cfg.get("w_point_recon", 0.0)) * p2p
+                        + loss_cfg["w_align"] * contrastive
                     )
 
                 optim.zero_grad(set_to_none=True)
@@ -564,7 +605,8 @@ def main():
                 meters["total"].update(total.item(), bs)
                 meters["text_recon"].update(text_recon.item(), bs)
                 meters["point2text_recon"].update(p2t.item(), bs)
-                meters["align"].update(align.item(), bs)
+                meters["point_recon"].update(p2p.item(), bs)
+                meters["contrastive"].update(contrastive.item(), bs)
 
                 global_step += 1
 
@@ -577,7 +619,8 @@ def main():
                         loss=meters["total"].avg,
                         text=meters["text_recon"].avg,
                         p2t=meters["point2text_recon"].avg,
-                        align=meters["align"].avg,
+                        p2p=meters["point_recon"].avg,
+                        itc=meters["contrastive"].avg,
                     )
 
             # epoch-level train metrics (global)
@@ -595,7 +638,8 @@ def main():
                     loss=0.0,
                     text=0.0,
                     p2t=0.0,
-                    align=0.0,
+                    p2p=0.0,
+                    itc=0.0,
                     lr=optim.param_groups[0]["lr"],
                 )
 
@@ -617,12 +661,14 @@ def main():
                 console.print(
                     f"[bold]Epoch {epoch}/{epochs}[/bold] "
                     f"TRAIN total={train_synced['total']:.4f} text={train_synced['text_recon']:.4f} "
-                    f"p2t={train_synced['point2text_recon']:.4f} align={train_synced['align']:.4f}"
+                    f"p2t={train_synced['point2text_recon']:.4f} p2p={train_synced['point_recon']:.4f} "
+                    f"itc={train_synced['contrastive']:.4f}"
                 )
                 console.print(
                     f"[bold]Epoch {epoch}/{epochs}[/bold] "
                     f"VAL   total={val['total']:.4f} text={val['text_recon']:.4f} "
-                    f"p2t={val['point2text_recon']:.4f} align={val['align']:.4f}"
+                    f"p2t={val['point2text_recon']:.4f} p2p={val['point_recon']:.4f} "
+                    f"itc={val['contrastive']:.4f}"
                 )
 
                 # save ckpt (rank0 only)

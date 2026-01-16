@@ -121,6 +121,7 @@ class SharedTextDecoder(nn.Module):
     """
     非自回归 decoder：latent -> (max_text_len, 2048)
     """
+
     def __init__(
         self,
         d_text_out: int,
@@ -164,10 +165,62 @@ class SharedTextDecoder(nn.Module):
         return out
 
 
+class PointDecoder(nn.Module):
+    """
+    非自回归 decoder：latent -> (point_tokens, d_point_out)
+
+    设计理念与 SharedTextDecoder 一致：
+      - 使用固定长度的 learnable query tokens（对点云 token 序列位置做显式建模）
+      - 通过 cross-attention 从 latents 中读取信息
+      - 输出重构的 point feature token 序列
+    """
+
+    def __init__(
+        self,
+        d_point_out: int,
+        d_model: int,
+        point_tokens: int,
+        depth: int,
+        heads: int,
+        ff_mult: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.point_tokens = point_tokens
+
+        self.query_pos_emb = nn.Parameter(torch.randn(point_tokens, d_model) * 0.02)
+        self.drop = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList(
+            [TransformerDecoderLayer(d_model, heads=heads, ff_mult=ff_mult, dropout=dropout) for _ in range(depth)]
+        )
+
+        self.out_norm = nn.LayerNorm(d_model)
+        self.out_proj = nn.Linear(d_model, d_point_out)
+
+    def forward(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        latents: (B, N_latent, d_model)
+        """
+        B = latents.shape[0]
+        q = self.query_pos_emb.unsqueeze(0).expand(B, -1, -1)  # (B, point_tokens, d_model)
+        q = self.drop(q)
+
+        for layer in self.layers:
+            q = layer(q, q_key_padding_mask=None, latents=latents)
+
+        q = self.out_norm(q)
+        out = self.out_proj(q)  # (B, point_tokens, d_point_out)
+        return out
+
+
 class UnifiedPointTextAE(nn.Module):
     """
-    - Text AE: text -> text_latents -> shared_text_decoder -> text_recon
-    - Point->Text: point -> point_latents -> shared_text_decoder -> text_recon_from_point
+    - Text AE:      text  -> text_latents  -> shared_text_decoder -> text_recon
+    - Point->Text:  point -> point_latents -> shared_text_decoder -> text_recon_from_point
+    - Point AE:     point -> point_latents -> point_decoder       -> point_recon
+
+    其中 shared_text_decoder 在 Text AE 与 Point->Text 两条路径中复用。
     """
 
     def __init__(self, cfg_model: Dict):
@@ -195,10 +248,22 @@ class UnifiedPointTextAE(nn.Module):
             use_point_pos_emb=cfg_model.get("use_point_pos_emb", True),
         )
         self.shared_text_decoder = SharedTextDecoder(
-            d_text_out=cfg_model["d_text_in"],   # 重构回 2048
+            d_text_out=cfg_model["d_text_in"],  # 重构回 2048
             d_model=cfg_model["d_model"],
             max_text_len=cfg_model["max_text_len"],
             depth=cfg_model["decoder_depth"],
+            heads=cfg_model["heads"],
+            ff_mult=cfg_model["ff_mult"],
+            dropout=cfg_model["dropout"],
+        )
+
+        # 新增：PointDecoder，用于 point->point 的重构
+        point_decoder_depth = int(cfg_model.get("point_decoder_depth", cfg_model["decoder_depth"]))
+        self.point_decoder = PointDecoder(
+            d_point_out=cfg_model["d_point_in"],  # 重构回点云 token 的 feature 维度
+            d_model=cfg_model["d_model"],
+            point_tokens=cfg_model["point_tokens"],
+            depth=point_decoder_depth,
             heads=cfg_model["heads"],
             ff_mult=cfg_model["ff_mult"],
             dropout=cfg_model["dropout"],
@@ -215,9 +280,12 @@ class UnifiedPointTextAE(nn.Module):
         text_recon = self.shared_text_decoder(text_latents, target_mask=text_mask)
         text_recon_from_point = self.shared_text_decoder(point_latents, target_mask=text_mask)
 
+        point_recon = self.point_decoder(point_latents)
+
         return {
             "text_latents": text_latents,
             "point_latents": point_latents,
             "text_recon": text_recon,
             "text_recon_from_point": text_recon_from_point,
+            "point_recon": point_recon,
         }

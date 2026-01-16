@@ -28,6 +28,8 @@ model:
 
   resampler_depth: 2
   decoder_depth: 6
+  # 可选：单独控制 point decoder 的层数；不填则默认等于 decoder_depth
+  # point_decoder_depth: 6
 
   heads: 8
   ff_mult: 4
@@ -37,13 +39,22 @@ model:
   use_text_pos_emb: true
 
 loss:
+  # reconstruction losses
   w_text_recon: 1.0
   w_point2text_recon: 1.0
+  w_point_recon: 0.3
+
+  # latent alignment (now: contrastive ITC)
   w_align: 0.1
 
   recon_mse: 1.0
   recon_cos: 0.1
-  align_type: "cosine"
+
+  # align_type: [contrastive | cosine | mse]
+  align_type: "contrastive"
+  contrastive_temperature: 0.07
+  # DDP 下是否 all_gather 扩充 negatives（强烈建议 true）
+  contrastive_gather: true
 
 train:
   batch_size: 64
@@ -61,7 +72,7 @@ train:
   amp: true
   log_every: 50
 
-  save_dir: "checkpoints/unified_ae_features"
+  save_dir: "checkpoints/unified_ae_contrastive"
 
   scheduler:
     type: "cosine"

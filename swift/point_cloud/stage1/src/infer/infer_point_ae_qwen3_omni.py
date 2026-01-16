@@ -127,7 +127,7 @@ MAX_POINT_TOKENS = 128
 POINT_POOLING = "mean"  # "mean" | "first"
 
 # ===== 生成超参数 =====
-MAX_NEW_TOKENS = 64
+MAX_NEW_TOKENS = 256
 DO_SAMPLE = False
 TEMPERATURE = 0.7   # DO_SAMPLE=False 时 temperature 不生效
 TOP_P = 0.9         # DO_SAMPLE=False 时 top_p 不生效
