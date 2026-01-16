@@ -7,39 +7,84 @@ infer_point_ae_qwen3_omni.py
 - 将该 embedding 注入到 Qwen3-Omni 的输入中，替换 prompt 里 <point> 对应 token span 的 inputs_embeds
 - 对若干条样本进行推理，打印模型输出与 GT（对话 JSON 中的 gpt value）
 
+本版新增（只改与 baseline/调试输出相关的部分，其它逻辑保持不动）：
+1) 新增 baseline：直接注入 Ground Truth text embedding（来自 feature dataset 的 text_embeds/text_mask）
+   - 用于验证：LLM 是否能“理解”GT embedding 并用它回答问题（从而分离“注入是否有效”与“点云->embedding 是否有效”）
+2) 新增调试：可视化检查 text_recon_from_point 是否真正替换了 <point> span 的 inputs_embeds，并展示“变成了什么样”
+   - 展示 span 对应 token、max|diff|、与 payload 的一致性、并可选做 embedding->token 的最近邻 proxy（Top-K）
+3) 调试输出美化：优先使用 rich（若环境未安装 rich，会自动 fallback 到 print）
+4) 其它不需要改动的无关部分不改动
+
 依赖（建议）：
 - transformers==4.57.3（Qwen3-Omni repo 推荐版本）
 - accelerate
 - torch
+- rich（可选，用于美化输出；未安装则自动降级）
 
 你自己的工程依赖：
 - swift.point_cloud.stage1.src.data.feature_dataset.ProcessedPointTextFeatureDataset
 - swift.point_cloud.stage1.src.models.unified_ae.UnifiedPointTextAE
-
-注意：
-- 本脚本不使用命令行参数；超参数/路径都在文件顶部配置。
 """
 
 from __future__ import annotations
 
-import os
 import json
 import random
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 # ====== 你的模块（保持与训练脚本一致的 import 路径）======
 from swift.point_cloud.stage1.src.data.feature_dataset import ProcessedPointTextFeatureDataset
 from swift.point_cloud.stage1.src.models.unified_ae import UnifiedPointTextAE
-
 
 # ====== Qwen3-Omni (Transformers) ======
 from transformers import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeProcessor,
 )
+
+# ====== rich（可选）======
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.pretty import Pretty
+    from rich.text import Text
+    from rich import box
+
+    _RICH_AVAILABLE = True
+    _console = Console()
+except Exception:
+    _RICH_AVAILABLE = False
+    _console = None
+    Console = None
+    Table = None
+    Panel = None
+    Pretty = None
+    Text = None
+    box = None
+
+
+def _p(obj: Any = "", **kwargs: Any) -> None:
+    """rich.print 的轻量封装；rich 不可用时 fallback 到 print。"""
+    if _console is not None:
+        _console.print(obj, **kwargs)
+    else:
+        print(obj)
+
+
+def _rule(title: str = "") -> None:
+    if _console is not None:
+        _console.rule(title)
+    else:
+        if title:
+            print("=" * 100 + " " + title)
+        else:
+            print("=" * 100)
+
 
 # =========================
 # 0) 超参数 & 路径（直接改这里）
@@ -70,9 +115,15 @@ SEED = 42
 # prompt 里的占位符文本
 POINT_PLACEHOLDER = "<point>"
 
-# ===== 用 AE 产生的 text_recon_from_point (L,H) 怎么压成一个向量 (H) =====
-# "mean": 按 text_mask 对有效 token 平均池化
-# "first": 取第一个有效 token 的向量
+# ===== 注入策略 =====
+# "sequence": 不压缩，取 mask=True 的所有 token embedding，逐 token 注入（推荐与你问题对应）
+# "pooled":   压缩成单向量，再覆盖 <point> 的 span（旧逻辑保留）
+POINT_INJECT_MODE = "sequence"  # "sequence" | "pooled"
+
+# sequence 模式下最多注入多少个 token（强烈建议限制，避免 K 过大导致推理很慢/爆显存）
+MAX_POINT_TOKENS = 128
+
+# pooled 模式下的 pooling（仅当 POINT_INJECT_MODE="pooled" 才用）
 POINT_POOLING = "mean"  # "mean" | "first"
 
 # ===== 生成超参数 =====
@@ -82,7 +133,23 @@ TEMPERATURE = 0.7   # DO_SAMPLE=False 时 temperature 不生效
 TOP_P = 0.9         # DO_SAMPLE=False 时 top_p 不生效
 
 # 是否也跑一个 baseline（不注入 embedding）方便你对比
+# 注意：sequence 模式下 baseline 默认用“同一个 expanded prompt（K 个 <point>）但不注入”，这样 prompt length 一致
 RUN_BASELINE_NO_INJECT = True
+
+# ===== 新增 baseline：注入 Ground Truth text embedding =====
+RUN_BASELINE_GT_TEXT_EMBED_INJECT = True
+
+# ===== 调试与输出（新增）=====
+# 是否显示更详细的注入 debug（spans/patterns + embed 替换校验）
+DEBUG_SHOW_INJECTION_DEBUG = True
+
+# 在 debug 表格里最多展示前多少个 span（避免输出过长）
+DEBUG_MAX_SHOW_SPANS = 8
+
+# 是否对注入向量做一个“最近邻 token proxy”（Top-K），帮助你直观看 embedding “像什么词”
+# 注意：这会做 vocab 级别的 matmul（但只对少量 span 做），一般可接受；如太慢可关掉
+DEBUG_SHOW_TOPK_TOKEN_PROXIES = True
+DEBUG_TOPK_TOKENS = 6
 
 # system prompt（可按需要修改）
 SYSTEM_PROMPT = (
@@ -121,6 +188,22 @@ def find_all_subsequence_positions(haystack: List[int], needle: List[int]) -> Li
         if haystack[i:i+n] == needle:
             out.append(i)
     return out
+
+
+def expand_point_placeholders(user_text: str, k: int, placeholder: str = "<point>") -> str:
+    """
+    将 user_text 中首次出现的 <point> 替换为 k 个 <point>（用空格分隔）。
+    如果 user_text 不含 <point>，则在开头追加一段。
+    """
+    k = int(k)
+    if k <= 1:
+        return user_text
+
+    block = " ".join([placeholder] * k)
+    if placeholder in user_text:
+        return user_text.replace(placeholder, block, 1)
+    # fallback：没有 placeholder 的情况
+    return block + "\n" + user_text
 
 
 # =========================
@@ -240,6 +323,40 @@ def load_ae_from_ckpt(ckpt_path: str, device: torch.device, dtype: torch.dtype) 
     return ae, cfg
 
 
+def resolve_safe_pad_token_id(tokenizer, model=None) -> int:
+    """
+    为 inputs_embeds + generate 场景准备一个安全的 pad_token_id：
+    - 优先 tokenizer.pad_token_id（Qwen3 一般是 <|endoftext|>）
+    - 若 tokenizer 没设，尝试从词表里找 <|endoftext|>
+    - 最重要：保证 pad_token_id != eos_token_id
+    """
+    eos = getattr(tokenizer, "eos_token_id", None)
+
+    pad = getattr(tokenizer, "pad_token_id", None)
+
+    if pad is None:
+        # Qwen3 tokenizer_config.json 里 pad_token 通常就是 <|endoftext|>
+        try:
+            cand = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+            if isinstance(cand, int) and cand >= 0:
+                pad = cand
+        except Exception:
+            pad = None
+
+    if pad is None and model is not None:
+        pad = getattr(getattr(model, "generation_config", None), "pad_token_id", None)
+
+    if pad is None:
+        # 最后兜底：选一个非 eos 的 id（仅用于 generate 内部伪造 prompt ids，不参与 forward embed）
+        pad = 0 if eos != 0 else 1
+
+    if eos is not None and pad == eos:
+        # 关键：inputs_embeds 生成时 pad==eos 会导致“立即结束”
+        pad = 0 if eos != 0 else 1
+
+    return int(pad)
+
+
 @torch.no_grad()
 def ae_point_to_text_token_embeddings(
     ae: UnifiedPointTextAE,
@@ -320,72 +437,284 @@ def build_qwen_inputs(processor: Qwen3OmniMoeProcessor, user_text: str) -> Dict[
 
 
 @torch.no_grad()
-def inject_point_embedding_into_inputs_embeds(
+def inject_point_embeddings_into_inputs_embeds(
     *,
-    model: Qwen3OmniMoeThinkerForConditionalGeneration,
     tokenizer,
-    input_ids: torch.Tensor,      # (1, S)
-    inputs_embeds: torch.Tensor,  # (1, S, H)
-    point_embedding: torch.Tensor,# (H,)
+    input_ids: torch.Tensor,       # (1, S)
+    inputs_embeds: torch.Tensor,   # (1, S, H)
+    point_embeddings: torch.Tensor,# (H,) 或 (K, H)
     point_placeholder: str = "<point>",
-) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[int]]:
+) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[Tuple[str, List[int]]]]:
     """
-    在 inputs_embeds 中，将 prompt 里 "<point>" 对应 token span 的 embedding 替换为 point_embedding。
-    由于 "<point>" 可能被分成多个 token，因此用子序列匹配方式找到 span。
+    在 inputs_embeds 中，将 prompt 里 <point> 对应 token span 的 embedding 替换为 point_embeddings。
+
+    - 若 point_embeddings 形状是 (H,)：行为与旧版一致，对所有匹配到的 span 用同一个向量覆盖。
+    - 若 point_embeddings 形状是 (K,H)：则需要在 prompt 中找到至少 K 个 <point> span，
+      并按出现顺序，第 i 个 span 用 point_embeddings[i] 覆盖。
+
+    重要修复点（相对你旧函数）：
+    - 不能只选一个 needle_ids（因为重复 <point> 后，tokenization 可能存在 "<point>" vs " <point>" vs "<point>\\n" 等差异）
+    - 需要同时搜索多个 needle variant，然后从左到右挑选 K 个不重叠 span
 
     返回：
       new_inputs_embeds: (1,S,H)
-      spans: [(start, end), ...]   # end is exclusive
-      needle_ids: tokenizer.encode(point_placeholder, add_special_tokens=False)
+      spans: [(start, end), ...]   # token span, end exclusive
+      patterns: [(pattern_text, pattern_ids), ...]  # 调试用：本次搜索用到的所有 pattern
     """
-    # 1) needle token ids
-    needle_ids = tokenizer.encode(point_placeholder, add_special_tokens=False)
-    if len(needle_ids) == 0:
-        raise RuntimeError(f"Tokenizer encodes placeholder into empty ids: {point_placeholder}")
-
-    # 2) find spans in prompt
-    prompt_ids = input_ids[0].tolist()
-    starts = find_all_subsequence_positions(prompt_ids, needle_ids)
-
-    # 某些情况下 prompt 里是 "<point>\n"（紧跟换行），尝试备用 needle
-    if len(starts) == 0:
-        for variant in [point_placeholder + "\n", point_placeholder + "\r\n", " " + point_placeholder, " " + point_placeholder + "\n"]:
-            var_ids = tokenizer.encode(variant, add_special_tokens=False)
-            if len(var_ids) == 0:
-                continue
-            starts = find_all_subsequence_positions(prompt_ids, var_ids)
-            if len(starts) > 0:
-                needle_ids = var_ids
-                break
-
-    if len(starts) == 0:
-        raise RuntimeError(
-            f"Cannot find placeholder token sequence in prompt. "
-            f"placeholder='{point_placeholder}', needle_ids={needle_ids[:10]}..., prompt_len={len(prompt_ids)}"
-        )
-
-    # 3) replace each span
+    prompt_ids: List[int] = input_ids[0].tolist()
     new_embeds = inputs_embeds.clone()
     H = new_embeds.shape[-1]
-    if point_embedding.numel() != H:
-        raise RuntimeError(f"point_embedding dim mismatch: got {point_embedding.numel()} vs hidden {H}")
+
+    # ---- normalize point_embeddings shape ----
+    if point_embeddings.dim() == 1:
+        if point_embeddings.numel() != H:
+            raise RuntimeError(f"point_embeddings dim mismatch: got {point_embeddings.numel()} vs hidden {H}")
+        K = None  # replace all matched spans with the same vector
+    elif point_embeddings.dim() == 2:
+        if point_embeddings.shape[1] != H:
+            raise RuntimeError(f"point_embeddings dim mismatch: got {point_embeddings.shape[1]} vs hidden {H}")
+        K = int(point_embeddings.shape[0])
+        if K <= 0:
+            raise RuntimeError("point_embeddings has zero length (K=0).")
+    else:
+        raise RuntimeError(f"point_embeddings must be (H,) or (K,H), got shape={tuple(point_embeddings.shape)}")
+
+    # ---- build multiple needle variants (text -> ids) ----
+    variant_texts = [
+        point_placeholder,
+        " " + point_placeholder,
+        "\n" + point_placeholder,
+        point_placeholder + "\n",
+        " " + point_placeholder + "\n",
+        "\r\n" + point_placeholder,
+        point_placeholder + "\r\n",
+        " " + point_placeholder + "\r\n",
+    ]
+
+    patterns: List[Tuple[str, List[int]]] = []
+    seen = set()
+    for vt in variant_texts:
+        ids = tokenizer.encode(vt, add_special_tokens=False)
+        if len(ids) == 0:
+            continue
+        key = tuple(ids)
+        if key in seen:
+            continue
+        seen.add(key)
+        patterns.append((vt, ids))
+
+    if len(patterns) == 0:
+        raise RuntimeError(f"Tokenizer encodes placeholder into empty ids for all variants: {point_placeholder}")
+
+    # ---- collect candidate spans from all patterns ----
+    # candidate item: (start, end, length, pattern_index)
+    candidates: List[Tuple[int, int, int, int]] = []
+    for pi, (_, ids) in enumerate(patterns):
+        starts = find_all_subsequence_positions(prompt_ids, ids)
+        for st in starts:
+            ed = st + len(ids)
+            candidates.append((st, ed, len(ids), pi))
+
+    if len(candidates) == 0:
+        raise RuntimeError(
+            f"Cannot find placeholder token sequence in prompt for any variant. "
+            f"placeholder='{point_placeholder}', prompt_len={len(prompt_ids)}"
+        )
+
+    # ---- sort and greedily pick non-overlapping spans from left to right ----
+    # sort by start asc, then length desc (prefer longer match when overlapping)
+    candidates.sort(key=lambda x: (x[0], -x[2]))
 
     spans: List[Tuple[int, int]] = []
-    for st in starts:
-        ed = st + len(needle_ids)
+    used_until = 0
+    need = K if K is not None else 10**18  # large for scalar mode
+
+    for st, ed, _, _ in candidates:
+        if st < used_until:
+            continue
         spans.append((st, ed))
+        used_until = ed
+        if len(spans) >= need:
+            break
 
-        # 用同一个向量覆盖整个 span（span_len 可能 >1）
-        rep = point_embedding.to(device=new_embeds.device, dtype=new_embeds.dtype).view(1, 1, H)
-        rep = rep.expand(1, ed - st, H)  # (1, span_len, H)
-        new_embeds[:, st:ed, :] = rep
+    if K is not None and len(spans) < K:
+        raise RuntimeError(
+            f"Found only {len(spans)} non-overlapping placeholder spans, but need K={K}. "
+            f"Try adjusting MAX_POINT_TOKENS / prompt expansion / patterns."
+        )
 
-    return new_embeds, spans, needle_ids
+    # ---- replace embeddings ----
+    if K is None:
+        # scalar mode: replace all spans with same vector
+        rep0 = point_embeddings.to(device=new_embeds.device, dtype=new_embeds.dtype).view(1, 1, H)
+        for st, ed in spans:
+            new_embeds[:, st:ed, :] = rep0.expand(1, ed - st, H)
+        return new_embeds, spans, patterns
+
+    # sequence mode: replace first K spans with corresponding vectors
+    for i in range(K):
+        st, ed = spans[i]
+        vec = point_embeddings[i].to(device=new_embeds.device, dtype=new_embeds.dtype).view(1, 1, H)
+        new_embeds[:, st:ed, :] = vec.expand(1, ed - st, H)
+
+    return new_embeds, spans[:K], patterns
+
+
+# =========================
+# 4.5) 新增：注入 debug（embedding 替换校验 + token proxy）
+# =========================
+
+@torch.no_grad()
+def _topk_token_proxies(
+    *,
+    tokenizer,
+    emb_weight: torch.Tensor,              # (V,H)
+    emb_weight_norm: Optional[torch.Tensor],  # (V,)
+    vec: torch.Tensor,                     # (H,)
+    k: int,
+) -> List[Tuple[int, str, float]]:
+    """
+    用输入 embedding 矩阵做一个最近邻 token proxy（cosine）。
+    返回 [(token_id, token_str, score), ...]
+    """
+    if k <= 0:
+        return []
+
+    w = emb_weight
+    v = vec.to(device=w.device, dtype=w.dtype)
+
+    dot = torch.matmul(w, v)  # (V,)
+    v_norm = v.norm().clamp_min(1e-6)
+
+    if emb_weight_norm is None:
+        scores = dot / v_norm
+    else:
+        denom = (emb_weight_norm * v_norm).clamp_min(1e-6)
+        scores = dot / denom
+
+    kk = min(int(k), int(scores.numel()))
+    topv, topi = torch.topk(scores, k=kk, largest=True)
+
+    ids = topi.detach().cpu().tolist()
+    scs = topv.detach().float().cpu().tolist()
+    toks = tokenizer.convert_ids_to_tokens(ids)
+    return [(int(i), str(t), float(s)) for i, t, s in zip(ids, toks, scs)]
+
+
+@torch.no_grad()
+def render_injection_debug(
+    *,
+    label: str,
+    tokenizer,
+    input_ids: torch.Tensor,        # (1,S)
+    base_embeds: torch.Tensor,      # (1,S,H)
+    injected_embeds: torch.Tensor,  # (1,S,H)
+    spans: List[Tuple[int, int]],
+    payload: torch.Tensor,          # (H,) or (K,H)
+    emb_weight: Optional[torch.Tensor] = None,
+    emb_weight_norm: Optional[torch.Tensor] = None,
+    max_show_spans: int = 8,
+    show_topk: bool = True,
+    topk: int = 6,
+) -> None:
+    """
+    用于验证：payload（尤其是 text_recon_from_point）是否真的替换到了 inputs_embeds 中，
+    并展示注入向量的大致 token 语义（Top-K 最近邻 proxy）。
+    """
+    if (not DEBUG_SHOW_INJECTION_DEBUG) and (_console is None):
+        return
+
+    scalar_mode = payload.dim() == 1
+    show_n = min(len(spans), int(max_show_spans))
+
+    # ---- rich table ----
+    if _console is not None:
+        tb = Table(
+            title=f"[bold]Injection Debug[/bold] - {label}",
+            box=box.SIMPLE_HEAVY,
+            show_lines=False,
+        )
+        tb.add_column("#", justify="right", style="bold")
+        tb.add_column("span", justify="left")
+        tb.add_column("token_ids", justify="left")
+        tb.add_column("tokens", justify="left", overflow="fold")
+        tb.add_column("max|inj-base|", justify="right")
+        tb.add_column("max|inj-payload|", justify="right")
+        tb.add_column("cos(base,inj)", justify="right")
+        tb.add_column("||payload||", justify="right")
+        if show_topk and (emb_weight is not None):
+            tb.add_column(f"Top-{topk} token proxy", justify="left", overflow="fold")
+
+        for i in range(show_n):
+            st, ed = spans[i]
+            ids = input_ids[0, st:ed].tolist()
+            toks = tokenizer.convert_ids_to_tokens(ids)
+
+            base_seg = base_embeds[0, st:ed, :]      # (len,H)
+            inj_seg = injected_embeds[0, st:ed, :]   # (len,H)
+
+            base_vec = base_seg[0]
+            inj_vec = inj_seg[0]
+
+            payload_vec = payload if scalar_mode else payload[i]
+            # 校验：注入后的 span 是否等于 payload（broadcast）
+            max_diff_payload = (inj_seg - payload_vec).abs().max().item()
+            # 校验：注入后是否真的改变了原始 embedding
+            max_diff_base = (inj_seg - base_seg).abs().max().item()
+
+            cos_bi = float(F.cosine_similarity(base_vec.view(1, -1), inj_vec.view(1, -1), dim=-1).item())
+            payload_norm = float(payload_vec.norm().item())
+
+            topk_str = ""
+            if show_topk and (emb_weight is not None):
+                proxies = _topk_token_proxies(
+                    tokenizer=tokenizer,
+                    emb_weight=emb_weight,
+                    emb_weight_norm=emb_weight_norm,
+                    vec=payload_vec,
+                    k=topk,
+                )
+                # token 里可能有换行/特殊字符，这里做轻量 escape，避免表格错位
+                def _esc(s: str) -> str:
+                    return s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+                topk_str = ", ".join([f"{_esc(t)}({s:.3f})" for _, t, s in proxies])
+
+            tb.add_row(
+                str(i),
+                f"[{st},{ed})",
+                ",".join(map(str, ids)),
+                " ".join(toks),
+                f"{max_diff_base:.3e}",
+                f"{max_diff_payload:.3e}",
+                f"{cos_bi:.3f}",
+                f"{payload_norm:.3f}",
+                topk_str if (show_topk and (emb_weight is not None)) else "",
+            )
+
+        _console.print(tb)
+    else:
+        # fallback 简化输出
+        print(f"[DEBUG] Injection Debug - {label}")
+        for i in range(show_n):
+            st, ed = spans[i]
+            ids = input_ids[0, st:ed].tolist()
+            toks = tokenizer.convert_ids_to_tokens(ids)
+            base_seg = base_embeds[0, st:ed, :]
+            inj_seg = injected_embeds[0, st:ed, :]
+            payload_vec = payload if scalar_mode else payload[i]
+            max_diff_payload = (inj_seg - payload_vec).abs().max().item()
+            max_diff_base = (inj_seg - base_seg).abs().max().item()
+            print(f"  [{i}] span=[{st},{ed}) ids={ids} toks={toks} "
+                  f"max|inj-base|={max_diff_base:.3e} max|inj-payload|={max_diff_payload:.3e}")
 
 
 # =========================
 # 5) 生成（优先 generate，失败则 fallback greedy）
 # =========================
+
+_PAD_DEBUG_PRINTED = False  # 新增：避免每次 generate 都刷屏
+
 
 @torch.no_grad()
 def generate_with_inputs_embeds(
@@ -399,34 +728,56 @@ def generate_with_inputs_embeds(
     temperature: float,
     top_p: float,
 ) -> str:
-    """
-    用 inputs_embeds + (attention_mask/position_ids/...) 做 generation。
-    """
     tokenizer = processor.tokenizer
 
     # 复制 inputs，移除 input_ids，注入 inputs_embeds
     gen_kwargs = {k: v for k, v in inputs.items() if k != "input_ids"}
     gen_kwargs["inputs_embeds"] = inputs_embeds
 
-    # 一些模型需要显式 pad_token_id
-    if getattr(tokenizer, "pad_token_id", None) is None:
-        # 兜底：用 eos 作为 pad
-        gen_kwargs["pad_token_id"] = tokenizer.eos_token_id
+    # --- 关键修复：显式指定一个“安全的 pad_token_id”，并保证 != eos ---
+    pad_id = resolve_safe_pad_token_id(tokenizer, model)
+    gen_kwargs["pad_token_id"] = pad_id
 
-    # generation config
+    global _PAD_DEBUG_PRINTED
+    if not _PAD_DEBUG_PRINTED:
+        _p(
+            f"[DEBUG] tokenizer.pad_token_id={tokenizer.pad_token_id}, "
+            f"eos_token_id={tokenizer.eos_token_id}, resolved_pad_id={pad_id}",
+            style="dim" if _console is not None else None,
+        )
+        _PAD_DEBUG_PRINTED = True
+
+    # eos 也建议显式给（对 Qwen 系列通常是 <|im_end|>）
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        gen_kwargs["eos_token_id"] = tokenizer.eos_token_id
+
+    # 只在 do_sample 时传 temperature/top_p，避免 None 进入 generate（更稳）
+    extra = {}
+    if do_sample:
+        extra["temperature"] = float(temperature)
+        extra["top_p"] = float(top_p)
+
     gen_out = model.generate(
         **gen_kwargs,
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
-        temperature=temperature if do_sample else None,
-        top_p=top_p if do_sample else None,
+        **extra,
     )
 
-    # gen_out: (1, prompt+new)
+    # ---- 解码：对 inputs_embeds 场景做鲁棒处理 ----
+    # 理论上 gen_out 是 (prompt + new)；但不同版本/实现可能只返回 new。
     prompt_len = inputs_embeds.shape[1]
-    new_tokens = gen_out[0, prompt_len:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    return text.strip()
+    seq = gen_out[0]
+
+    if seq.shape[0] > prompt_len:
+        new_tokens = seq[prompt_len:]
+    else:
+        # 没有包含 prompt 的情况（或根本没生成任何 token）
+        new_tokens = seq
+
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False).strip()
+
+    return text
 
 
 @torch.no_grad()
@@ -439,20 +790,15 @@ def greedy_fallback_generate(
     max_new_tokens: int,
 ) -> str:
     """
-    简易 greedy fallback：
+    简易 greedy fallback（仅兜底用）：
     - step0 用 inputs_embeds 喂入
     - 后续 step 用 input_ids + past_key_values
     - 尝试维护 attention_mask；若 inputs 里有 position_ids，也做简单递增扩展
-
-    该 fallback 对 Qwen3-Omni 的 MRoPE/多模态 position 机制不一定完全稳，
-    仅作为 generate 不可用时的兜底。
     """
-    # 基础字段
     attention_mask = inputs.get("attention_mask", None)
     position_ids = inputs.get("position_ids", None)
     padding_mask = inputs.get("padding_mask", None)
 
-    # step0
     out = model(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
@@ -460,13 +806,12 @@ def greedy_fallback_generate(
         padding_mask=padding_mask,
         use_cache=True,
     )
-    logits = out.logits  # (1, S, V)
+    logits = out.logits
     past = out.past_key_values
 
     generated: List[int] = []
     eos = tokenizer.eos_token_id
 
-    # helper: extend masks/pos
     def _extend_attention_mask(am: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if am is None:
             return None
@@ -476,38 +821,35 @@ def greedy_fallback_generate(
     def _extend_padding_mask(pm: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if pm is None:
             return None
-        one = torch.zeros((pm.shape[0], 1), device=pm.device, dtype=pm.dtype)  # padding_mask: 0 means not padded?
-        # 这里不确定 padding_mask 语义；保守起见：新增 token 设为非 padding（0）
+        one = torch.zeros((pm.shape[0], 1), device=pm.device, dtype=pm.dtype)
         return torch.cat([pm, one], dim=1)
 
     def _extend_position_ids(pid: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if pid is None:
             return None
-        # pid 可能是 (B, S) 或 (B, 3, S)
         if pid.dim() == 2:
-            last = pid[:, -1:]  # (B,1)
+            last = pid[:, -1:]
             nxt = last + 1
             return torch.cat([pid, nxt], dim=1)
         if pid.dim() == 3:
-            last = pid[:, :, -1:]  # (B,3,1)
+            last = pid[:, :, -1:]
             nxt = last + 1
             return torch.cat([pid, nxt], dim=2)
         return pid
 
     for _ in range(max_new_tokens):
-        next_id = torch.argmax(logits[:, -1, :], dim=-1)  # (1,)
+        next_id = torch.argmax(logits[:, -1, :], dim=-1)
         tid = int(next_id.item())
         generated.append(tid)
         if eos is not None and tid == eos:
             break
 
-        # extend masks/pos for next step
         attention_mask = _extend_attention_mask(attention_mask)
         padding_mask = _extend_padding_mask(padding_mask)
         position_ids = _extend_position_ids(position_ids)
 
         out = model(
-            input_ids=next_id.unsqueeze(0),  # (1,1)
+            input_ids=next_id.unsqueeze(0),
             attention_mask=attention_mask,
             position_ids=position_ids,
             padding_mask=padding_mask,
@@ -581,11 +923,11 @@ def main() -> None:
             "Please check object_id consistency / scan range."
         )
 
-    print(f"[INFO] Feature dataset total={len(feat_ds)}")
-    print(f"[INFO] Candidate={len(candidate)} matched_in_json={len(samples)} (will run {len(samples)})")
+    _p(f"[INFO] Feature dataset total={len(feat_ds)}", style="green" if _console is not None else None)
+    _p(f"[INFO] Candidate={len(candidate)} matched_in_json={len(samples)} (will run {len(samples)})", style="green" if _console is not None else None)
+    _p(f"[INFO] POINT_INJECT_MODE={POINT_INJECT_MODE}, MAX_POINT_TOKENS={MAX_POINT_TOKENS}", style="green" if _console is not None else None)
 
     # -------- 2) load Qwen3-Omni Thinker + processor --------
-    # dtype="auto"：让 HF 自己选 bf16/fp16
     model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
         QWEN_MODEL_NAME_OR_PATH,
         dtype="auto",
@@ -599,27 +941,38 @@ def main() -> None:
     emb_layer = model.get_input_embeddings()
     emb_device = emb_layer.weight.device
     emb_dtype = emb_layer.weight.dtype
+    llm_hidden = emb_layer.weight.shape[1]
 
-    print(f"[INFO] Qwen embedding device={emb_device}, dtype={emb_dtype}, hidden={emb_layer.weight.shape[1]}")
+    _p(f"[INFO] Qwen embedding device={emb_device}, dtype={emb_dtype}, hidden={llm_hidden}", style="green" if _console is not None else None)
 
     # -------- 3) load AE（放到同一个 device/dtype 更省拷贝）--------
     ae, ae_cfg = load_ae_from_ckpt(AE_CKPT_PATH, device=emb_device, dtype=emb_dtype)
 
-    # 简单 sanity check：AE 输出维度应等于 LLM hidden
+    # sanity check：AE 输出维度应等于 LLM hidden
     ae_d_text_in = int(ae_cfg["model"]["d_text_in"])
-    if ae_d_text_in != emb_layer.weight.shape[1]:
-        print(
-            f"[WARN] Dimension mismatch: AE d_text_in={ae_d_text_in} vs Qwen hidden={emb_layer.weight.shape[1]}. "
-            f"Injection may fail."
+    if ae_d_text_in != llm_hidden:
+        _p(
+            f"[WARN] Dimension mismatch: AE d_text_in={ae_d_text_in} vs Qwen hidden={llm_hidden}. "
+            f"Injection will fail unless you add a trained projection.",
+            style="yellow" if _console is not None else None,
         )
+
+    # ---- 新增：为 token proxy（Top-K）准备 embedding norm（只在需要时计算一次）----
+    emb_weight = emb_layer.weight
+    emb_weight_norm = None
+    if DEBUG_SHOW_INJECTION_DEBUG and DEBUG_SHOW_TOPK_TOKEN_PROXIES:
+        try:
+            emb_weight_norm = emb_weight.norm(dim=1).clamp_min(1e-6)
+        except Exception:
+            emb_weight_norm = None
 
     # -------- 4) run inference --------
     for si, sample in enumerate(samples):
         obj_id = sample["object_id"]
-        human = conv_map[obj_id]["human"]
+        human_raw = conv_map[obj_id]["human"]
         gt = conv_map[obj_id]["gpt"]
 
-        # 4.1 AE: point -> pred text tokens -> pooled vector
+        # 4.1 AE: point -> pred text tokens
         pred_tokens, mask = ae_point_to_text_token_embeddings(
             ae=ae,
             point_tokens=sample["point_tokens"],     # (G,D) CPU
@@ -628,26 +981,66 @@ def main() -> None:
             device=emb_device,
             dtype=emb_dtype,
         )
-        point_vec = pool_text_tokens_to_single_embedding(pred_tokens, mask, mode=POINT_POOLING)  # (H,)
 
-        # 4.2 build Qwen inputs
+        # ===== 新增 baseline 1：准备 GT text embedding（来自 feature dataset）=====
+        # 注意：为了公平对比，GT 与 AE 都使用同样的 mask / 同样的 K（并受 MAX_POINT_TOKENS 限制）
+        gt_text_tokens = to_device_dtype(sample["text_embeds"], emb_device, emb_dtype)  # (L,H)
+
+        # 4.2 构造 point 注入向量（sequence or pooled）
+        if POINT_INJECT_MODE == "sequence":
+            # ---- AE payload ----
+            if mask.any():
+                ae_seq = pred_tokens[mask]        # (Kfull,H)
+                gt_seq = gt_text_tokens[mask]     # (Kfull,H)
+            else:
+                # 极端兜底：mask 全 False
+                ae_seq = pred_tokens[:1]
+                gt_seq = gt_text_tokens[:1]
+
+            # cap
+            if ae_seq.shape[0] > MAX_POINT_TOKENS:
+                ae_seq = ae_seq[:MAX_POINT_TOKENS]
+                gt_seq = gt_seq[:MAX_POINT_TOKENS]
+
+            K = int(ae_seq.shape[0])
+
+            # 扩展 human prompt：把一个 <point> 扩展成 K 个 <point>
+            human = expand_point_placeholders(human_raw, K, POINT_PLACEHOLDER)
+
+            # 两个注入版本
+            point_payload_ae = ae_seq  # (K,H)
+            point_payload_gt = gt_seq  # (K,H)
+
+        elif POINT_INJECT_MODE == "pooled":
+            # pooled：分别对 AE 与 GT 做 pooling（同一个 mask）
+            point_vec_ae = pool_text_tokens_to_single_embedding(pred_tokens, mask, mode=POINT_POOLING)      # (H,)
+            point_vec_gt = pool_text_tokens_to_single_embedding(gt_text_tokens, mask, mode=POINT_POOLING)  # (H,)
+            human = human_raw
+            point_payload_ae = point_vec_ae
+            point_payload_gt = point_vec_gt
+            K = 1
+        else:
+            raise ValueError(f"Unknown POINT_INJECT_MODE: {POINT_INJECT_MODE}")
+
+        # 4.3 build Qwen inputs（注意：baseline 和 inject 都用同一个 inputs，保证 prompt length 一致）
         inputs = build_qwen_inputs(processor, human)
-        # move to model device (按官方示例)
         inputs = {k: v.to(emb_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-
         input_ids = inputs["input_ids"]  # (1,S)
 
-        # baseline (no inject)
+        # baseline (no inject) —— 用同一个 prompt，不注入 embedding
         baseline_text = None
         if RUN_BASELINE_NO_INJECT:
             try:
-                base_out = model.generate(
+                gen_kwargs = dict(
                     **inputs,
                     max_new_tokens=MAX_NEW_TOKENS,
                     do_sample=DO_SAMPLE,
-                    temperature=TEMPERATURE if DO_SAMPLE else None,
-                    top_p=TOP_P if DO_SAMPLE else None,
                 )
+                if DO_SAMPLE:
+                    gen_kwargs["temperature"] = TEMPERATURE
+                    gen_kwargs["top_p"] = TOP_P
+
+                base_out = model.generate(**gen_kwargs)
                 prompt_len = input_ids.shape[1]
                 baseline_text = tokenizer.decode(
                     base_out[0, prompt_len:],
@@ -657,28 +1050,64 @@ def main() -> None:
             except Exception as e:
                 baseline_text = f"[baseline generation failed: {repr(e)}]"
 
-        # 4.3 compute embeds & inject
+        # 4.4 compute embeds & inject（base embeds）
         with torch.no_grad():
             base_embeds = emb_layer(input_ids)  # (1,S,H)
 
+        # ===== 新增 baseline 1：注入 GT text embedding =====
+        gt_inject_text = None
+        gt_injected_embeds = None
+        gt_spans: List[Tuple[int, int]] = []
+        gt_patterns: List[Tuple[str, List[int]]] = []
+        if RUN_BASELINE_GT_TEXT_EMBED_INJECT:
+            try:
+                gt_injected_embeds, gt_spans, gt_patterns = inject_point_embeddings_into_inputs_embeds(
+                    tokenizer=tokenizer,
+                    input_ids=input_ids,
+                    inputs_embeds=base_embeds,
+                    point_embeddings=point_payload_gt,
+                    point_placeholder=POINT_PLACEHOLDER,
+                )
+                gt_inject_text = generate_with_inputs_embeds(
+                    model=model,
+                    processor=processor,
+                    inputs=inputs,
+                    inputs_embeds=gt_injected_embeds,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=DO_SAMPLE,
+                    temperature=TEMPERATURE,
+                    top_p=TOP_P,
+                )
+            except Exception as e:
+                gt_inject_text = f"[GT-embed inject failed: {repr(e)}]"
+
+        # ===== 原逻辑：注入 AE(text_recon_from_point) embedding =====
+        pred_text = None
+        injected_embeds = None
+        spans: List[Tuple[int, int]] = []
+        patterns: List[Tuple[str, List[int]]] = []
+
         try:
-            injected_embeds, spans, needle_ids = inject_point_embedding_into_inputs_embeds(
-                model=model,
+            injected_embeds, spans, patterns = inject_point_embeddings_into_inputs_embeds(
                 tokenizer=tokenizer,
                 input_ids=input_ids,
                 inputs_embeds=base_embeds,
-                point_embedding=point_vec,
+                point_embeddings=point_payload_ae,
                 point_placeholder=POINT_PLACEHOLDER,
             )
         except Exception as e:
-            print("=" * 100)
-            print(f"[{si}] object_id={obj_id}")
-            print("[ERROR] injection failed:", repr(e))
-            print("Human:", human)
-            print("GT   :", gt)
+            _rule()
+            _p(f"[{si}] object_id={obj_id}", style="bold red" if _console is not None else None)
+            _p("[ERROR] injection failed: " + repr(e), style="bold red" if _console is not None else None)
+            _p("Human(raw):")
+            _p(human_raw)
+            _p("Human(used):")
+            _p(human)
+            _p("GT:")
+            _p(gt)
             continue
 
-        # 4.4 generate with injected embeds
+        # 4.5 generate with injected embeds
         try:
             pred_text = generate_with_inputs_embeds(
                 model=model,
@@ -690,6 +1119,7 @@ def main() -> None:
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
             )
+
         except Exception as e:
             # fallback
             try:
@@ -704,26 +1134,96 @@ def main() -> None:
             except Exception as e2:
                 pred_text = f"[inject generation failed: {repr(e)}; fallback also failed: {repr(e2)}]"
 
-        # 4.5 print result
-        print("=" * 100)
-        print(f"[{si}] object_id: {obj_id}")
-        print(f"needle_ids(len={len(needle_ids)}): {needle_ids}")
-        print(f"matched spans: {spans}")
-        print("-" * 80)
-        print("Human(prompt):")
-        print(human)
-        print("-" * 80)
-        if RUN_BASELINE_NO_INJECT:
-            print("Baseline(no inject):")
-            print(baseline_text)
-            print("-" * 80)
-        print("Pred(inject AE embedding):")
-        print(pred_text)
-        print("-" * 80)
-        print("GT(answer):")
-        print(gt)
+        # 4.6 pretty print result（rich）
+        _rule(f"[bold cyan]Sample {si}[/bold cyan]  object_id={obj_id}" if _console is not None else f"Sample {si} object_id={obj_id}")
 
-    print("\n[INFO] Done.")
+        # meta info
+        if _console is not None:
+            meta = Table(title="Meta", box=box.SIMPLE, show_header=False)
+            meta.add_row("object_id", str(obj_id))
+            meta.add_row("global_index", str(sample.get("global_index", "N/A")))
+            meta.add_row("POINT_INJECT_MODE", str(POINT_INJECT_MODE))
+            if POINT_INJECT_MODE == "sequence":
+                meta.add_row("K(injected)", f"{K} (capped by MAX_POINT_TOKENS={MAX_POINT_TOKENS})")
+            else:
+                meta.add_row("pooled_mode", str(POINT_POOLING))
+            meta.add_row("RUN_BASELINE_NO_INJECT", str(RUN_BASELINE_NO_INJECT))
+            meta.add_row("RUN_BASELINE_GT_TEXT_EMBED_INJECT", str(RUN_BASELINE_GT_TEXT_EMBED_INJECT))
+            _console.print(meta)
+        else:
+            if POINT_INJECT_MODE == "sequence":
+                _p(f"[INFO] injected K={K} point tokens (capped by MAX_POINT_TOKENS={MAX_POINT_TOKENS})")
+            else:
+                _p(f"[INFO] pooled injection mode={POINT_POOLING}")
+
+        # debug: spans/patterns
+        if DEBUG_SHOW_INJECTION_DEBUG:
+            if _console is not None:
+                dbg = Table(title="Injection Locate Result", box=box.SIMPLE, show_header=False)
+                dbg.add_row("spans(len)", f"{len(spans)}  {spans[:10]}{' ...' if len(spans) > 10 else ''}")
+                dbg.add_row("patterns_tried", str(len(patterns)))
+                dbg.add_row("patterns", Pretty(patterns) if len(patterns) <= 16 else Pretty(patterns[:16] + [("...truncated...", [])]))
+                _console.print(dbg)
+            else:
+                _p(f"[DEBUG] spans(len={len(spans)}): {spans[:10]}{' ...' if len(spans) > 10 else ''}")
+                _p(f"[DEBUG] patterns_tried={len(patterns)}")
+                _p(f"[DEBUG] patterns: {patterns}")
+
+            # ===== 新增：embedding 替换校验（重点：AE text_recon_from_point）=====
+            render_injection_debug(
+                label="AE(text_recon_from_point)",
+                tokenizer=tokenizer,
+                input_ids=input_ids,
+                base_embeds=base_embeds,
+                injected_embeds=injected_embeds,
+                spans=spans,
+                payload=point_payload_ae,
+                emb_weight=emb_weight if DEBUG_SHOW_TOPK_TOKEN_PROXIES else None,
+                emb_weight_norm=emb_weight_norm if DEBUG_SHOW_TOPK_TOKEN_PROXIES else None,
+                max_show_spans=DEBUG_MAX_SHOW_SPANS,
+                show_topk=DEBUG_SHOW_TOPK_TOKEN_PROXIES,
+                topk=DEBUG_TOPK_TOKENS,
+            )
+
+        # prompt
+        if _console is not None:
+            _console.print(Panel(human, title="Human(prompt used)", border_style="cyan", expand=False))
+        else:
+            _p("Human(prompt used):")
+            _p(human)
+
+        # outputs
+        if _console is not None:
+            out_tb = Table(title="Outputs", box=box.SIMPLE_HEAVY)
+            out_tb.add_column("Variant", style="bold", justify="left")
+            out_tb.add_column("Text", overflow="fold", justify="left")
+
+            if RUN_BASELINE_NO_INJECT:
+                out_tb.add_row("Baseline(no inject, same prompt)", baseline_text if baseline_text is not None else "")
+            if RUN_BASELINE_GT_TEXT_EMBED_INJECT:
+                out_tb.add_row("Baseline(inject GT text_embeds)", gt_inject_text if gt_inject_text is not None else "")
+
+            out_tb.add_row("Pred(inject AE embedding)", pred_text if pred_text is not None else "")
+            out_tb.add_row("GT(answer)", gt)
+
+            _console.print(out_tb)
+        else:
+            _p("-" * 80)
+            if RUN_BASELINE_NO_INJECT:
+                _p("Baseline(no inject, same prompt):")
+                _p(baseline_text)
+                _p("-" * 80)
+            if RUN_BASELINE_GT_TEXT_EMBED_INJECT:
+                _p("Baseline(inject GT text_embeds):")
+                _p(gt_inject_text)
+                _p("-" * 80)
+            _p("Pred(inject AE embedding):")
+            _p(pred_text)
+            _p("-" * 80)
+            _p("GT(answer):")
+            _p(gt)
+
+    _p("\n[INFO] Done.", style="green" if _console is not None else None)
 
 
 if __name__ == "__main__":
