@@ -23,7 +23,7 @@ model:
   point_tokens: 513
   max_text_len: 128
 
-  d_model: 512
+  d_model: 2048
   num_latents: 32
 
   resampler_depth: 2
@@ -42,7 +42,7 @@ loss:
   # reconstruction losses
   w_text_recon: 1.0
   w_point2text_recon: 1.0
-  w_point_recon: 0.3
+  w_point_recon: 0.1
 
   # latent alignment (now: contrastive ITC)
   w_align: 0.1
@@ -62,7 +62,7 @@ train:
   pin_memory: true
   drop_last: true
 
-  epochs: 5
+  epochs: 20
 
   lr: 5e-5
   weight_decay: 0.05
@@ -72,7 +72,7 @@ train:
   amp: true
   log_every: 50
 
-  save_dir: "checkpoints/unified_ae_contrastive"
+  save_dir: "checkpoints/unified_ae_contrastive_long"
 
   scheduler:
     type: "cosine"
