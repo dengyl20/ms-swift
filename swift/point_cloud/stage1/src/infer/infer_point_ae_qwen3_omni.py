@@ -46,6 +46,10 @@ from transformers import (
     Qwen3OmniMoeProcessor,
 )
 
+# ===== OFFLINE MODE =====
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 # ====== rich（可选）======
 try:
     from rich.console import Console
@@ -91,19 +95,19 @@ def _rule(title: str = "") -> None:
 # =========================
 
 # 你训练好的 AE checkpoint（best.pt 或某个 epoch_xxx.pt）
-AE_CKPT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints/unified_ae_contrastive_long/best.pt"
+AE_CKPT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints/new_caption/best.pt"
 
 # stage1 提取 feature 的 dataset_info.yaml（里面记录 shards 路径、shape、dtype 等）
-FEATURE_DATASET_INFO_YAML = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features/dataset_info.yaml"
+FEATURE_DATASET_INFO_YAML = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned/dataset_info.yaml"
 
 # 你指定的原始对话 JSON（用于取 prompt 与 GT）
-CONV_JSON_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K.json"
+CONV_JSON_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K_cleaned.json"
 
 # Qwen3-Omni 模型（用 Instruct 权重加载 Thinker text-only，省显存）
 QWEN_MODEL_NAME_OR_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 # 只做定性：跑多少条
-NUM_SAMPLES = 8
+NUM_SAMPLES = 32
 
 # 从 feature dataset 扫描样本的起点与最大扫描量（防止一直找不到对应 object_id）
 DATASET_SCAN_START = 0

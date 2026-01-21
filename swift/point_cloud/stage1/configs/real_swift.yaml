@@ -3,7 +3,7 @@ seed: 42
 data:
   features:
     # 由 extract_features.py 生成的 dataset_info.yaml 路径
-    dataset_info_yaml: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features/dataset_info.yaml"
+    dataset_info_yaml: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned/dataset_info.yaml"
 
     # 仍沿用旧逻辑：对 object_id 做稳定 hash 来划分 train/val
     val_ratio: 0.01
@@ -23,7 +23,7 @@ model:
   point_tokens: 513
   max_text_len: 128
 
-  d_model: 2048
+  d_model: 512
   num_latents: 32
 
   resampler_depth: 2
@@ -72,7 +72,7 @@ train:
   amp: true
   log_every: 50
 
-  save_dir: "checkpoints/unified_ae_contrastive_long"
+  save_dir: "checkpoints/cleaned_base"
 
   scheduler:
     type: "cosine"

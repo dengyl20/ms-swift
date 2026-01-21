@@ -2,6 +2,8 @@
 *.npz
 checkpoints/
 data_features/
+data_features_cleaned/
+caption_length_stats/
 
 # Byte-compiled / optimized / DLL files
 tmp

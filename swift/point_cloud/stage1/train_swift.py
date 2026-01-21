@@ -35,7 +35,7 @@ from swift.point_cloud.stage1.src.utils.common import make_warmup_cosine_lambda,
 
 
 os.environ['POINT_CLOUD_DATA_PATH'] = '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/8192_npy'
-os.environ['POINT_CLOUD_ANNO_PATH'] = '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K.json'
+os.environ['POINT_CLOUD_ANNO_PATH'] = '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K_cleaned.json'
 
 CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "real_swift.yaml"
 console = Console()
