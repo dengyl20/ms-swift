@@ -10,9 +10,11 @@ export MIOPEN_CUSTOM_CACHE_DIR="${BASE}/miopen_cache"
 # export MIOPEN_DEBUG_DISABLE_SQL_WAL=1
 # export MIOPEN_DISABLE_CACHE=1
 
+export MASTER_PORT=${MASTER_PORT:-$((29500 + RANDOM % 1000))}
+echo "Using MASTER_PORT=$MASTER_PORT"
 
 
 # 3) 运行你的训练
 export MM_CFG="/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/point_cloud/stage1/configs/extract_features.yaml" 
 
-torchrun --nproc_per_node=8 -m swift.point_cloud.stage1.src.preprocess.extract_features
+torchrun --master_port $MASTER_PORT --nproc_per_node=8 -m swift.point_cloud.stage1.src.preprocess.extract_features

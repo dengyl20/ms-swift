@@ -24,7 +24,7 @@ dataset:
   max_samples: -1
 
 runtime:
-  output_dir: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned"
+  output_dir: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned_24"
   overwrite: false
 
   # dataloader
@@ -69,7 +69,7 @@ encoders:
     torch_dtype: "fp16"  # "fp16" | "bf16" | "fp32"
     extract_embedding_and_discard_model: true  # 仅保留 embedding table，释放大模型其余参数
 
-    max_text_len: 128
+    max_text_len: 24
     add_special_tokens: false
 
 distributed:

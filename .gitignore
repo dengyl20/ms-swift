@@ -3,6 +3,7 @@
 checkpoints/
 data_features/
 data_features_cleaned/
+data_features_cleaned_24/
 caption_length_stats/
 
 # Byte-compiled / optimized / DLL files

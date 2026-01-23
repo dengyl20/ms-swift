@@ -164,6 +164,100 @@ def build_manifest(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 # =============================
+# 新增：按 tokenizer 的 token 长度过滤 manifest（丢弃 > max_text_len 的样本）
+# =============================
+def filter_manifest_by_text_token_len(
+    manifest: List[Dict[str, Any]],
+    text_cfg: Dict[str, Any],
+    *,
+    batch_size: int = 4096,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    丢弃 token_len > max_text_len 的样本（不截断保留）。
+
+    注意：
+    - token_len 的计算与训练/抽特征保持一致：同一个 tokenizer + add_special_tokens 设置。
+    - 为了高效判断是否超过阈值，这里用 truncation=True, max_length=max_len+1，只需要知道是否 > max_len。
+    """
+    model_name = text_cfg["model_name_or_path"]
+    tok_name = text_cfg.get("tokenizer_name_or_path", model_name)
+    trust_remote_code = bool(text_cfg.get("trust_remote_code", True))
+
+    max_len = int(text_cfg.get("max_text_len", 128))
+    add_special_tokens = bool(text_cfg.get("add_special_tokens", False))
+
+    if max_len <= 0:
+        raise ValueError(f"encoders.text.max_text_len must be > 0, got {max_len}")
+
+    print(
+        f"[rank0] filtering manifest by text token length: "
+        f"max_len={max_len}, add_special_tokens={add_special_tokens}, tokenizer={tok_name}"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(tok_name, trust_remote_code=trust_remote_code)
+
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+
+    n = len(manifest)
+    t0 = time.time()
+
+    # 用于过滤的编码上限：max_len+1
+    # - 长度 <= max_len：编码长度就是实际长度
+    # - 长度 >  max_len：编码会被截到 max_len+1（>= max_len+1），据此丢弃即可
+    detect_len = max_len + 1
+
+    for start in range(0, n, batch_size):
+        end = min(n, start + batch_size)
+        texts = [str(manifest[i].get("gpt_text", "")) for i in range(start, end)]
+
+        enc = tokenizer(
+            texts,
+            padding=False,
+            truncation=True,
+            max_length=detect_len,
+            add_special_tokens=add_special_tokens,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+            return_length=True,
+        )
+
+        lens = enc.get("length", None)
+        if lens is None:
+            # 兼容极少数 tokenizer 不返回 length 的情况
+            input_ids = enc["input_ids"]
+            lens = [len(x) for x in input_ids]
+
+        for i, l in enumerate(lens):
+            if int(l) <= max_len:
+                m = dict(manifest[start + i])
+                m["text_token_len"] = int(l)
+                kept.append(m)
+            else:
+                dropped += 1
+
+        # 简单进度打印
+        if (end == n) or ((end // batch_size) % 50 == 0):
+            elapsed = time.time() - t0
+            print(
+                f"[rank0] text_len_filter progress: {end}/{n} "
+                f"kept={len(kept)} dropped={dropped} elapsed={elapsed:.1f}s"
+            )
+
+    # 重新连续编号 global_index，并保留过滤前编号用于追溯
+    for new_i, m in enumerate(kept):
+        m["global_index_before_text_filter"] = int(m.get("global_index", new_i))
+        m["global_index"] = int(new_i)
+
+    print(
+        f"[rank0] text_len_filter done: before={n} after={len(kept)} dropped={dropped} "
+        f"drop_ratio={dropped / max(n, 1):.6f}"
+    )
+    stats = {"before": n, "after": len(kept), "dropped": dropped, "max_len": max_len}
+    return kept, stats
+
+
+# =============================
 # Dataset: raw (load npy + pc_norm)
 # =============================
 def pc_norm_np(pc: np.ndarray) -> np.ndarray:
@@ -304,7 +398,6 @@ def split_indices_no_pad(n: int, rank: int, world_size: int, mode: str = "stride
 
 # =============================
 # Frozen Encoders (PointBERT)
-#   - 你提供的 FrozenPointBERTTokens 基本不变
 # =============================
 class FrozenPointBERTTokens(nn.Module):
     """
@@ -442,10 +535,13 @@ class FrozenQwenEmbeddingTableFromWeight(nn.Module):
 
     @torch.inference_mode()
     def forward(self, texts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 关键修改：
+        # - truncation=False，确保不会对超长文本“悄悄截断并保留”
+        # - 超长文本应当在 rank0 manifest 过滤阶段被丢弃；如果仍出现，这里会直接报错，便于定位问题。
         enc = self.tokenizer(
             texts,
             padding="max_length",
-            truncation=True,
+            truncation=False,
             max_length=self.max_text_len,
             add_special_tokens=self.add_special_tokens,
             return_tensors="pt",
@@ -629,7 +725,9 @@ def worker_main(
 
     manifest_pt = os.path.join(out_dir, "manifest.pt")
 
-    # ---- rank0: build manifest + cache qwen embedding weight ----
+    # ---- rank0: build manifest + (新增)按 token 长度过滤 + cache qwen embedding weight ----
+    text_len_filter_stats: Optional[Dict[str, int]] = None
+
     if rank == 0:
         if (not overwrite) and (os.path.exists(os.path.join(out_dir, "dataset_info.yaml"))):
             raise FileExistsError(
@@ -638,6 +736,17 @@ def worker_main(
             )
 
         manifest = build_manifest(cfg)
+
+        # ===== 新增：丢弃 token_len > max_text_len 的样本 =====
+        # 你想把 max_length 设为 24 并丢弃超长样本，那么必须在这里过滤，
+        # 否则后续 tokenizer 会 truncation=True 截断并保留（或者即使你改成 truncation=False 也会直接报错）。
+        text_cfg_rank0 = ecfg["text"]
+        manifest, text_len_filter_stats = filter_manifest_by_text_token_len(
+            manifest,
+            text_cfg_rank0,
+            batch_size=int(text_cfg_rank0.get("length_filter_batch_size", 4096)),
+        )
+
         torch.save(manifest, manifest_pt)
         print(f"[rank0] manifest saved to: {manifest_pt}  (N={len(manifest)})")
 
@@ -691,8 +800,6 @@ def worker_main(
     point_encoder = FrozenPointBERTTokens(ecfg["point"], device=device)
 
     # text (from cached weight)
-    # rank0 已回写 embedding_weight_cache 到 cfg['encoders']['text']，但其它 rank 的 cfg 是进程内副本，
-    # 因此这里再从 yaml 原值读取即可（通常 yaml 里已经设置 embedding_weight_cache）。
     text_cfg = ecfg["text"]
     weight_cache = text_cfg.get("embedding_weight_cache", os.path.join(cache_dir, "qwen_embed_weight.pt"))
     text_cfg["embedding_weight_cache"] = weight_cache
@@ -824,6 +931,8 @@ def worker_main(
                 "text": {"max_len": max_len, "hidden": hidden, "dtype": str(save_dtype)},
                 "point": {"num_tokens": G, "trans_dim": trans_dim, "dtype": str(save_dtype)},
             },
+            # 新增：记录文本长度过滤统计（如果需要追溯丢了多少样本）
+            "text_length_filter": text_len_filter_stats,
             "shards": shards,
         }
         info_path = os.path.join(out_dir, "dataset_info.yaml")

@@ -438,6 +438,39 @@ def ae_point_to_text_token_embeddings(
     return pred, text_mask.to(device=device)
 
 
+# @torch.no_grad()
+# def ae_point_to_text_token_embeddings(
+#     ae: UnifiedPointTextAE,
+#     point_tokens: torch.Tensor,  # (G,D)
+#     text_embeds: torch.Tensor,   # (L,H)
+#     text_mask: torch.Tensor,     # (L,) 仍保留入参，但会被覆盖
+#     device: torch.device,
+#     dtype: torch.dtype,
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     """
+#     返回：
+#       pred_text_tokens: (L,H)  = out["text_recon_from_point"][0]
+#       mask:            (L,)    = 固定前16位为True的mask
+#     """
+#     pt = to_device_dtype(point_tokens.unsqueeze(0), device, dtype)  # (1,G,D)
+#     te = to_device_dtype(text_embeds.unsqueeze(0), device, dtype)   # (1,L,H)
+
+#     # ===== 关键修改：固定mask前16位为True =====
+#     L = text_embeds.shape[0]
+#     fixed_len = 16
+#     fixed_mask = torch.zeros(L, dtype=torch.bool, device=device)
+#     fixed_mask[: min(fixed_len, L)] = True
+#     tm = fixed_mask.unsqueeze(0)  # (1,L)
+
+#     out = ae(point_feat=pt, text_feat=te, text_mask=tm)
+
+#     if "text_recon_from_point" not in out:
+#         raise RuntimeError("AE forward output missing key: 'text_recon_from_point'")
+
+#     pred = out["text_recon_from_point"][0]  # (L,H)
+#     return pred, fixed_mask
+
+
 @torch.no_grad()
 def pool_text_tokens_to_single_embedding(
     pred_text_tokens: torch.Tensor,  # (L,H)
