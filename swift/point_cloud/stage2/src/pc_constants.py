@@ -1,7 +1,7 @@
 # pc_constants.py
 from __future__ import annotations
 
-POINT_TOKEN = "<pointcloud>"
+POINT_TOKEN = "<point>"
 
 # 复用你推理脚本里的 system prompt（注意：不出现字面 "<point>"）
 DEFAULT_SYSTEM_PROMPT = (
@@ -23,7 +23,7 @@ ENV_FEATURE_INFO_YAML = "POINT_FEATURE_DATASET_INFO_YAML"
 ENV_CONV_JSON_PATH = "POINT_CONV_JSON_PATH"
 ENV_AE_CKPT_PATH = "POINT_AE_CKPT_PATH"
 
-# 可选：控制注入 token cap（默认 128，与推理脚本一致）
+# 可选：控制注入 token cap（默认 24，与推理脚本一致）
 ENV_MAX_INJECT_TOKENS = "POINT_MAX_INJECT_TOKENS"
 DEFAULT_MAX_INJECT_TOKENS = 24
 

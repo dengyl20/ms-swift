@@ -10,7 +10,7 @@ import torch.nn as nn
 from swift.point_cloud.stage2.src.pc_constants import DEFAULT_SYSTEM_PROMPT, POINT_TOKEN
 
 # ===== 兼容不同 ms-swift 版本导出路径 =====
-from swift.llm import Template, TemplateMeta, register_template
+from swift.template import Template, TemplateMeta, register_template
 
 
 def _as_torch(x: Any) -> torch.Tensor:
@@ -44,7 +44,7 @@ class Qwen3OmniPointTemplate(Template):
     use_model = True  # 关键：让 ms-swift 在 forward 前调用 _post_encode
 
     def _data_collator_mm_data(self, batch: List[Dict[str, Any]], padding_to: Optional[int] = None) -> Dict[str, Any]:
-        res = super()._data_collator_mm_data(batch, padding_to)
+        res = super()._data_collator_mm_data(batch)
 
         # collate point_tokens/text_mask/inject_len
         # batch[i] 来自 HF dataset row（我们在 loader 里 yield 的 dict）
@@ -181,7 +181,7 @@ def register_qwen3_omni_point_template(exists_ok: bool = True) -> None:
             system_prefix=["<|im_start|>system\n{{SYSTEM}}<|im_end|>\n"],
             default_system=DEFAULT_SYSTEM_PROMPT,
             auto_add_bos=True,
+            template_cls=Qwen3OmniPointTemplate,
         ),
-        template_cls=Qwen3OmniPointTemplate,
-        exists_ok=exists_ok,
+        exist_ok=exists_ok,
     )

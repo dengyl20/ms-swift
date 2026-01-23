@@ -5,11 +5,12 @@ import os
 from typing import Any, Dict, Optional
 
 import torch
+from transformers import PretrainedConfig
 
 from swift.point_cloud.stage2.src.pc_constants import ENV_AE_CKPT_PATH, POINT_TOKEN
 
 
-from swift.llm.model import Model, ModelGroup, ModelLoader, ModelMeta, register_model
+from swift.model import Model, ModelGroup, ModelLoader, ModelMeta, register_model
 from swift.utils import get_logger
 
 
@@ -64,22 +65,42 @@ class Qwen3OmniPointModelLoader(ModelLoader):
         return processor
 
     @staticmethod
-    def get_model(model_dir: str, model_info=None, model_kwargs=None, load_model: bool = True, **kwargs):
+    def get_model(
+        model_dir: str,
+        model_info: Optional[PretrainedConfig] = None,
+        processor: Optional[Any] = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        load_model: bool = True,
+        **kwargs,
+    ):
+        """
+        ms-swift register.py 调用形态（你堆栈已证实）：
+            get_model(model_dir, config, processor, model_kwargs_dict)
+
+        因此这里必须显式接收 processor 作为第三个位置参数。
+        同时做一些版本/错误调用的兼容。
+        """
         global _ADDED_TOKENIZER_LEN, _POINT_TOKEN_ID, _OLD_POINT_IDS
 
         if not load_model:
             return None
 
         model_kwargs = model_kwargs or {}
+        if not isinstance(model_kwargs, dict):
+            raise TypeError(
+                f"[Qwen3OmniPoint] model_kwargs must be a dict, but got: {type(model_kwargs)}. "
+                "This usually means get_model() signature doesn't match ms-swift calling convention."
+            )
 
         # 你推理脚本用的是 ThinkerForConditionalGeneration（text-only），这里沿用以省显存
         from transformers import Qwen3OmniMoeThinkerForConditionalGeneration
 
-        # 兼容 ms-swift 传参：torch_dtype/device_map 之类尽量透传
-        hf_kwargs = {}
+        # 透传 HF from_pretrained 关键参数（上游如果传了就带上）
+        hf_kwargs: Dict[str, Any] = {}
+
+        # 优先从 model_kwargs 拿（有些 swift 版本会放这里）
         for k in [
             "torch_dtype",
-            "dtype",
             "device_map",
             "attn_implementation",
             "trust_remote_code",
@@ -88,9 +109,24 @@ class Qwen3OmniPointModelLoader(ModelLoader):
             if k in model_kwargs:
                 hf_kwargs[k] = model_kwargs[k]
 
-        # transformers 通常用 torch_dtype
-        if "dtype" in hf_kwargs and "torch_dtype" not in hf_kwargs:
-            hf_kwargs["torch_dtype"] = hf_kwargs.pop("dtype")
+        # 兼容：有人可能传 dtype（而 HF 用 torch_dtype）
+        if "torch_dtype" not in hf_kwargs:
+            if "dtype" in model_kwargs:
+                hf_kwargs["torch_dtype"] = model_kwargs["dtype"]
+            elif "dtype" in kwargs:
+                hf_kwargs["torch_dtype"] = kwargs["dtype"]
+
+        # 也允许 kwargs 直接覆盖
+        for k in [
+            "torch_dtype",
+            "device_map",
+            "attn_implementation",
+            "trust_remote_code",
+            "low_cpu_mem_usage",
+        ]:
+            if k in kwargs:
+                hf_kwargs[k] = kwargs[k]
+
 
         model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(model_dir, **hf_kwargs)
 
@@ -155,7 +191,7 @@ class Qwen3OmniPointModelLoader(ModelLoader):
 
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
-        logger.info(f"[Qwen3OmniPoint] Model ready. trainable={trainable} / total={total}")
+        logger.warning(f"[Qwen3OmniPoint] Model ready. trainable={trainable} / total={total}")
 
         return model
 
@@ -167,13 +203,13 @@ def register_qwen3_omni_point_model(exists_ok: bool = True) -> None:
             # 这里尽量复用 ms-swift 已有的 arch 名称；如果你环境里 arch 名不同，你只要改这一行
             model_arch="qwen3_omni",
             template="qwen3_omni_point",
-            model_group=ModelGroup(
+            model_groups=ModelGroup(
                 [
                     Model("Qwen/Qwen3-Omni-30B-A3B-Instruct", "Qwen/Qwen3-Omni-30B-A3B-Instruct"),
                 ]
             ),
             tags=["pointcloud", "qwen3-omni", "projection"],
+            loader=Qwen3OmniPointModelLoader,
         ),
-        loader=Qwen3OmniPointModelLoader,
-        exists_ok=exists_ok,
+        exist_ok=exists_ok,
     )

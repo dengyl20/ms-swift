@@ -6,10 +6,12 @@ export POINT_AE_CKPT_PATH=/vast/users/guangyi.chen/causal_group/yunlong.deng/Mul
 export POINT_MAX_INJECT_TOKENS=24
 export POINT_REQUIRE_VALID=1
 
-
-
+MODEL_DIR="/vast/users/guangyi.chen/.cache/huggingface/hub/models--Qwen--Qwen3-Omni-30B-A3B-Instruct/snapshots/26291f793822fb6be9555850f06dfe95f2d7e695" 
+nproc_per_node=4
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NPROC_PER_NODE=$nproc_per_node \
 swift sft \
-  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --model "${MODEL_DIR}" \
   --model_type qwen3_omni_point \
   --template qwen3_omni_point \
   --dataset pointcloud_feature_sft \
@@ -20,4 +22,20 @@ swift sft \
   --output_dir /vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints \
   --tuner_type full \
   --num_train_epochs 1 \
-  --batch_size 1
+  --torch_dtype bfloat16 \
+  --per_device_train_batch_size 1 \
+  --per_device_eval_batch_size 1 \
+  --attn_impl flash_attn \
+  --packing true \
+  --gradient_accumulation_steps 1 \
+  --gradient_checkpointing false \
+  --logging_steps 5 \
+  --warmup_ratio 0.05 \
+  --learning_rate 5e-5 \
+  --max_steps 10000 \
+  --freeze_llm True \
+  --freeze_parameters_regex '^(?!point_ae\.).*' \
+  --trainable_parameters_regex '^point_ae\.' \
+  --dataset_num_proc 1 \
+  --dataloader_num_workers 1 \
+  --max_length 64 

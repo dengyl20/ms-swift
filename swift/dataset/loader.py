@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
+import inspect
 from contextlib import nullcontext
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple, Union
@@ -40,6 +41,78 @@ class DatasetLoader(BaseDatasetLoader):
         self.download_mode = download_mode
         self.columns = columns
         self.remove_unused_columns = remove_unused_columns
+
+    # ==========================
+    # NEW: delegate to DatasetMeta.loader if provided
+    # ==========================
+    def _maybe_get_custom_loader(self, dataset_meta: Optional[DatasetMeta]) -> Optional[BaseDatasetLoader]:
+        """
+        If dataset_meta.loader is set to a custom loader (class or instance), return an instance of it.
+        Otherwise return None.
+
+        Design goals:
+        - Backward compatible: default behavior unchanged
+        - No recursion: if self already is instance of that loader, don't re-enter delegation
+        - Robust init: filter kwargs by the loader __init__ signature
+        """
+        if dataset_meta is None:
+            return None
+
+        loader_obj = getattr(dataset_meta, 'loader', None)
+        if loader_obj is None:
+            return None
+
+        # Case 1: an already-created loader instance
+        if isinstance(loader_obj, BaseDatasetLoader):
+            if loader_obj is self:
+                return None
+            # If someone stored DatasetLoader() as loader, ignore to avoid cycles
+            if isinstance(loader_obj, DatasetLoader):
+                return None
+            return loader_obj
+
+        # Case 2: a loader class
+        if isinstance(loader_obj, type):
+            # If it's DatasetLoader itself, ignore
+            if loader_obj is DatasetLoader:
+                return None
+            # Avoid recursion if we are already that loader type (e.g. subclass calling super().load)
+            if isinstance(self, loader_obj):
+                return None
+
+            init_kwargs = dict(
+                num_proc=self.num_proc,
+                load_from_cache_file=self.load_from_cache_file,
+                streaming=self.streaming,
+                hub_token=self.hub_token,
+                strict=self.strict,
+                download_mode=self.download_mode,
+                columns=self.columns,
+                remove_unused_columns=self.remove_unused_columns,
+            )
+
+            # Filter kwargs by signature to be safe across versions/custom loaders
+            try:
+                sig = inspect.signature(loader_obj.__init__)
+                allowed = set(sig.parameters.keys())
+                allowed.discard('self')
+                init_kwargs = {k: v for k, v in init_kwargs.items() if k in allowed}
+            except Exception:
+                pass
+
+            try:
+                return loader_obj(**init_kwargs)
+            except Exception as e:
+                raise RuntimeError(
+                    f'Failed to instantiate custom loader `{loader_obj}` from DatasetMeta.loader. '
+                    f'init_kwargs={init_kwargs}, error={e}'
+                )
+
+        # Other types are not supported
+        raise TypeError(
+            f'Unsupported DatasetMeta.loader type: {type(loader_obj)}. '
+            'Please set it to a BaseDatasetLoader instance or a loader class.'
+        )
 
     def _load_dataset_path(
         self,
@@ -156,6 +229,21 @@ class DatasetLoader(BaseDatasetLoader):
         *,
         use_hf: Optional[bool] = None,
     ) -> HfDataset:
+        # ==========================
+        # NEW: delegate to DatasetMeta.loader
+        # ==========================
+        custom_loader = self._maybe_get_custom_loader(dataset_meta)
+        if custom_loader is not None:
+            # 只打印一次，避免多次日志污染
+            try:
+                ds_name = getattr(dataset_meta, 'dataset_name', None) or getattr(dataset_meta, 'ms_dataset_id', None) \
+                    or getattr(dataset_meta, 'hf_dataset_id', None) or str(getattr(dataset_syntax, 'dataset', ''))
+            except Exception:
+                ds_name = str(getattr(dataset_syntax, 'dataset', ''))
+            logger.info_once(f'Using custom DatasetMeta.loader={custom_loader.__class__.__name__} for dataset `{ds_name}`')
+            return custom_loader.load(dataset_syntax, dataset_meta, use_hf=use_hf)
+
+        # default behavior (unchanged)
         if dataset_syntax.dataset_type == 'path':
             dataset = self._load_dataset_path(
                 dataset_syntax.dataset,
@@ -231,63 +319,6 @@ def load_dataset(
     This function provides a unified interface to load datasets from various sources (HuggingFace,
     ModelScope, or local paths), with support for splitting, shuffling, streaming, and interleaving
     multiple datasets. It also handles self-cognition dataset preprocessing for model training.
-
-    Args:
-        datasets: Single dataset name or list of dataset names to load. Can use special syntax
-            for advanced configurations (e.g., 'dataset_name#1000' for sampling).
-        split_dataset_ratio: Ratio for splitting dataset into train/validation sets.
-            Value between 0 and 1. If 0, no validation split is created. Default: 0.
-        seed: Random seed for reproducibility. Can be an integer or numpy RandomState object.
-            If None, results will be non-deterministic. Default: 42.
-        num_proc: Number of processes to use for dataset preprocessing. Set to None for
-            streaming mode. Default: 1.
-        load_from_cache_file: Whether to load preprocessed data from cache if available.
-            Default: True.
-        shuffle: Whether to shuffle the dataset(s) after loading. Default: False.
-        streaming: Enable streaming mode for large datasets that don't fit in memory.
-            When True, num_proc is automatically set to None. Default: False.
-        interleave_prob: Probability weights for interleaving multiple datasets. Must have
-            same length as datasets list. If None, datasets are concatenated instead. Default: None.
-        stopping_strategy: Strategy when interleaving datasets of different lengths:
-            - 'first_exhausted': Stop when shortest dataset is exhausted
-            - 'all_exhausted': Continue until all datasets are exhausted
-            Default: 'first_exhausted'.
-        shuffle_buffer_size: Buffer size for shuffling in streaming mode. Larger values
-            provide better randomization but use more memory. Default: 1000.
-        use_hf: Force using HuggingFace Hub (True) or ModelScope (False). If None,
-            it is controlled by the environment variable `USE_HF`, which defaults to '0'.
-            Default: None.
-        hub_token: Authentication token for accessing private datasets on the hub. Default: None.
-        strict: If True, raise exceptions when encountering malformed data rows.
-            If False, skip invalid rows with warnings. Default: False.
-        download_mode: How to handle existing cached datasets:
-            - 'reuse_dataset_if_exists': Use cached version if available
-            - 'force_redownload': Always download fresh copy
-            Default: 'reuse_dataset_if_exists'.
-        columns: Manual column name mapping for datasets. Dictionary mapping source column
-            names to target column names (e.g., {'text': 'content'}). Default: None.
-        remove_unused_columns: Whether to remove columns not used in preprocessing.
-            Helps reduce memory usage. Default: True.
-        model_name: Model name for self-cognition task preprocessing. Can be a tuple of
-            (Chinese_name, English_name) or list of names. Default: None.
-        model_author: Model author for self-cognition task preprocessing. Can be a tuple of
-            (Chinese_author, English_author) or list of authors. Default: None.
-
-    Returns:
-        A tuple of (train_dataset, val_dataset):
-            - train_dataset: The training dataset
-            - val_dataset: The validation dataset if split_dataset_ratio > 0, otherwise None
-
-    Examples:
-        >>> # Load single dataset
-        >>> train_ds, val_ds = load_dataset('AI-ModelScope/alpaca-gpt4-data-zh', split_dataset_ratio=0.1)
-
-        >>> # Load multiple datasets
-        >>> train_ds, _ = load_dataset(
-        ...     ['AI-ModelScope/alpaca-gpt4-data-zh#500', 'swift/self-cognition#500'],
-        ...     model_name=('我的模型', 'MyModel'),
-        ...     model_author=('作者', 'Author')
-        ... )
     """
     init_self_cognition_preprocessor(DATASET_MAPPING.get('self-cognition'), model_name, model_author)
     if isinstance(datasets, str):
@@ -315,16 +346,26 @@ def load_dataset(
     for dataset in datasets:
         dataset_syntax = DatasetSyntax.parse(dataset)
         use_hf = dataset_syntax.use_hf or use_hf_default
+
         # compat dataset_name
         if dataset_syntax.dataset in DATASET_MAPPING:
             dataset_meta = DATASET_MAPPING[dataset_syntax.dataset]
-            if dataset_syntax.use_hf is None and dataset_meta.dataset_path is not None:
-                dataset_syntax.dataset = dataset_meta.dataset_path
-                dataset_syntax.dataset_type = 'path'
-            else:
-                dataset_syntax.dataset = dataset_meta.hf_dataset_id if use_hf else dataset_meta.ms_dataset_id
+
+            # ==========================
+            # NEW: if DatasetMeta.loader is custom, do NOT rewrite dataset_syntax.dataset
+            # ==========================
+            meta_loader = getattr(dataset_meta, 'loader', None)
+            has_custom_loader = meta_loader is not None and meta_loader is not DatasetLoader
+            if not has_custom_loader:
+                if dataset_syntax.use_hf is None and dataset_meta.dataset_path is not None:
+                    dataset_syntax.dataset = dataset_meta.dataset_path
+                    dataset_syntax.dataset_type = 'path'
+                else:
+                    dataset_syntax.dataset = dataset_meta.hf_dataset_id if use_hf else dataset_meta.ms_dataset_id
+            # else: keep dataset_syntax as-is; DatasetLoader.load will delegate to dataset_meta.loader
         else:
             dataset_meta = dataset_syntax.get_dataset_meta(use_hf)
+
         train_dataset = loader.load(dataset_syntax, dataset_meta, use_hf=use_hf)
         train_dataset, val_dataset = loader.post_process(
             train_dataset,
