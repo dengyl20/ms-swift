@@ -1,0 +1,21 @@
+dataset_info_yaml: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features/dataset_info.yaml"
+require_valid: true
+
+print:
+  compute_stats: true
+  preview_values: 8
+  float_precision: 5
+  show_shards_table: true
+  check_file_sizes: true
+
+samples:
+  indices: [0, 1, 2, -1]      # -1 表示最后一个
+  random_k: 3
+  random_seed: 123
+
+dataloader_test:
+  enabled: true
+  batch_size: 4
+  num_workers: 0
+  pin_memory: false
+  num_batches: 2

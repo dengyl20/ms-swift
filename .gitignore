@@ -5,7 +5,7 @@ data_features/
 data_features_cleaned/
 data_features_cleaned_24/
 caption_length_stats/
-image_audio_text/
+# image_audio_text/
 
 # Byte-compiled / optimized / DLL files
 tmp

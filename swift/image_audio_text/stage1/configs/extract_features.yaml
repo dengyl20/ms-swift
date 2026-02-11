@@ -1,0 +1,79 @@
+seed: 1234
+
+dataset:
+  anno_path: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K_cleaned.json"   # 原始 json list
+  point_root: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/8192_npy"
+  pointnum: 8192
+  use_color: true
+  normalize_pc: true
+
+  # 是否要求样本里出现 <point>
+  require_point_indicator: true
+  point_indicator: "<point>"
+
+  # 如果 anno 里有 conversation_type 字段，可按需过滤；为空则不过滤
+  conversation_types: []   # 例如: ["simple_description"]
+
+  # 从 conversations 取 gpt 文本的策略：first / last / concat
+  gpt_text_strategy: "first"
+
+  # 预先检查 point npy 文件是否存在（推荐 true）
+  verify_point_files: true
+
+  # debug：>0 则只用前 N 条
+  max_samples: -1
+
+runtime:
+  output_dir: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned_24"
+  overwrite: false
+
+  # dataloader
+  batch_size: 32
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  persistent_workers: true
+
+  # 保存精度（建议 fp16）
+  save_dtype: "fp16"
+
+  # 每多少个 step flush 一次 memmap（防止长任务意外中断）
+  flush_every: 50
+  log_every: 20
+
+encoders:
+  point:
+    ckpt_path: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM_7B_v1.1_init/point_bert_v1.2.pt"
+    return_tokens: true
+    drop_cls: false                 # True => x[:,1:] => (B,512,trans_dim)
+    input_dtype: "fp32"            # "fp32" 更稳；如确定可用可改 "fp16"
+
+    # 注意：必须与你的 checkpoint 匹配
+    config:
+      trans_dim: 384
+      depth: 12
+      num_heads: 8
+      drop_path_rate: 0.1
+      mlp_ratio: 4.0
+
+      num_group: 512
+      group_size: 32
+      point_dims: 6
+      encoder_dims: 256
+
+  text:
+    model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    tokenizer_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    trust_remote_code: true
+
+    torch_dtype: "fp16"  # "fp16" | "bf16" | "fp32"
+    extract_embedding_and_discard_model: true  # 仅保留 embedding table，释放大模型其余参数
+
+    max_text_len: 24
+    add_special_tokens: false
+
+distributed:
+  # 单机 8 GPU：如果你用 python 直接运行，会用这个 num_gpus 做 mp.spawn
+  # 如果你用 torchrun 启动，则以 torchrun 的 WORLD_SIZE 为准
+  num_gpus: 8
+  backend: "nccl"

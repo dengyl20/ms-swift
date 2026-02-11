@@ -1,0 +1,27 @@
+seed: 1234
+
+dataset:
+  coco_root: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/spokencoco"
+  spokencoco_root: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/spokencoco/SpokenCOCO"
+  train_json: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/spokencoco/SpokenCOCO/SpokenCOCO_train.json"
+  val_json: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/spokencoco/SpokenCOCO/SpokenCOCO_val.json"
+  verify_files: true
+  skip_missing: true
+  max_samples: -1
+
+runtime:
+  output_dir: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_spokencoco/1"
+  overwrite: false
+  batch_size: 4
+  num_workers: 4
+  pin_memory: true
+  save_dtype: "fp16"
+  log_every: 20
+
+encoders:
+  qwen:
+    model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    max_text_len: 64
+    image_tokens: 256
+    audio_tokens: 128
+

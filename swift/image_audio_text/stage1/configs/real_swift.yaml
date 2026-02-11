@@ -1,0 +1,79 @@
+seed: 42
+
+data:
+  features:
+    # 由 extract_features.py 生成的 dataset_info.yaml 路径
+    dataset_info_yaml: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned_24/dataset_info.yaml"
+
+    # 仍沿用旧逻辑：对 object_id 做稳定 hash 来划分 train/val
+    val_ratio: 0.01
+
+    # 建议：过滤 valid==0 的样本（避免训练中断/污染）
+    filter_invalid: true
+
+    # dataset __getitem__ 若遇到 invalid 是否抛错（在 filter_invalid=true 下通常不会触发）
+    require_valid: true
+
+    # 调试用：限制 train / val 各自最多取 N 条（null 表示不限制）
+    max_samples: null
+
+model:
+  d_text_in: 2048
+  d_point_in: 384
+  point_tokens: 513
+  max_text_len: 24
+
+  d_model: 512
+  num_latents: 32
+
+  resampler_depth: 2
+  decoder_depth: 6
+  # 可选：单独控制 point decoder 的层数；不填则默认等于 decoder_depth
+  # point_decoder_depth: 6
+
+  heads: 8
+  ff_mult: 4
+  dropout: 0.1
+
+  use_point_pos_emb: true
+  use_text_pos_emb: true
+
+loss:
+  # reconstruction losses
+  w_text_recon: 1.0
+  w_point2text_recon: 1.0
+  w_point_recon: 0.1
+
+  # latent alignment (now: contrastive ITC)
+  w_align: 0.1
+
+  recon_mse: 1.0
+  recon_cos: 0.1
+
+  # align_type: [contrastive | cosine | mse]
+  align_type: "contrastive"
+  contrastive_temperature: 0.07
+  # DDP 下是否 all_gather 扩充 negatives（强烈建议 true）
+  contrastive_gather: true
+
+train:
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+
+  epochs: 20
+
+  lr: 5e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+
+  amp: true
+  log_every: 50
+
+  save_dir: "checkpoints/stage1/1"
+
+  scheduler:
+    type: "cosine"
+    warmup_steps: 500
