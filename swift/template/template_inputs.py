@@ -26,7 +26,6 @@ class StdTemplateInputs:
     images: List[Union[str, Image.Image]] = field(default_factory=list)
     videos: List[str] = field(default_factory=list)
     audios: List[str] = field(default_factory=list)
-    points: List[Any] = field(default_factory=list)
     objects: Dict[str, Any] = field(default_factory=dict)
 
     margin: Optional[float] = None  # for reward modeling
@@ -37,7 +36,6 @@ class StdTemplateInputs:
         self.image_idx = 0
         self.audio_idx = 0
         self.video_idx = 0
-        self.point_idx = 0
         self.ref_idx = 0
         self.bbox_idx = 0
         if self.images and not isinstance(self.images, (list, tuple)):
@@ -46,8 +44,6 @@ class StdTemplateInputs:
             self.videos = [self.videos]
         if self.audios and not isinstance(self.audios, (list, tuple)):
             self.audios = [self.audios]
-        if self.points and not isinstance(self.points, (list, tuple)):
-            self.points = [self.points]
 
     def to_history(self):
         if not self.messages:
@@ -56,7 +52,7 @@ class StdTemplateInputs:
 
     @property
     def is_multimodal(self):
-        return bool(self.images or self.audios or self.videos or self.points or self.objects)
+        return bool(self.images or self.audios or self.videos or self.objects)
 
     @classmethod
     def from_dict(cls, inputs: Dict[str, Any]) -> 'StdTemplateInputs':
@@ -107,7 +103,7 @@ class StdTemplateInputs:
 
     @staticmethod
     def remove_messages_media(messages: Messages) -> Dict[str, Any]:
-        res = {'images': [], 'audios': [], 'videos': [], 'points': []}
+        res = {'images': [], 'audios': [], 'videos': []}
         for message in messages:
             content = message['content']
             if isinstance(content, str):
@@ -123,8 +119,8 @@ class StdTemplateInputs:
                 if key == 'text':
                     new_content += value
                     continue
-                # image/audio/video/point
-                # image_url/audio_url/video_url/point_url
+                # image/audio/video
+                # image_url/audio_url/video_url
                 if key.endswith('_url'):
                     key = key[:-len('_url')]
                 new_content += f'<{key}>'

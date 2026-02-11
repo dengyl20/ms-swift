@@ -59,7 +59,6 @@ class Template(ProcessorMixin):
     image_placeholder = ['<image>']
     video_placeholder = ['<video>']
     audio_placeholder = ['<audio>']
-    point_placeholder = ['<point>']
     cot_process_placeholder = ['ки']
     placeholder_tokens = []  # For clearer printing
     load_images = True
@@ -802,7 +801,7 @@ class Template(ProcessorMixin):
     def _tokenize(self, context, **kwargs):
         return self.tokenizer(context, return_attention_mask=False, add_special_tokens=False, **kwargs)['input_ids']
 
-    def replace_tag(self, media_type: Literal['image', 'video', 'audio', 'point'], index: int,
+    def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
         """Override this function to do your own replace operation.
 
@@ -833,8 +832,6 @@ class Template(ProcessorMixin):
                 return self.video_placeholder
         elif media_type == 'audio':
             return self.audio_placeholder
-        elif media_type == 'point':
-            return self.point_placeholder
 
     def replace_ref(self, ref: str, index: int, inputs: StdTemplateInputs) -> List[Context]:
         """Replace objects referenced by the bbox to contents or input_ids. This is useful in the grounding task.
@@ -921,11 +918,11 @@ class Template(ProcessorMixin):
         res_loss_scale: List[float] = []  # result of loss_scale_list
 
         # reset
-        for k in ['video', 'audio', 'point', 'object', 'box']:
+        for k in ['video', 'audio', 'object', 'box']:
             setattr(inputs, f'{k}_idx', 0)
 
         for context, loss_scale in zip(context_list, loss_scale_list):
-            for k in ['video', 'audio', 'point']:
+            for k in ['video', 'audio']:
                 if context == f'<{k}>' and inputs.is_multimodal and getattr(inputs, f'{k}_idx') < len(
                         getattr(inputs, f'{k}s')):
                     c_list = self.replace_tag(k, getattr(inputs, f'{k}_idx'), inputs)
@@ -966,7 +963,7 @@ class Template(ProcessorMixin):
         total_content = '\n'.join(total_content)
         if inputs.system:
             total_content = f'{inputs.system}\n{total_content}'
-        for media_type in ['image', 'audio', 'video', 'point']:
+        for media_type in ['image', 'audio', 'video']:
             media_key, media_tag = f'{media_type}s', f'<{media_type}>'
             medias = getattr(inputs, media_key)
             if not isinstance(medias, list):
@@ -1291,7 +1288,7 @@ class Template(ProcessorMixin):
             # For multi-modal models, images do not need to be pre processed here
             # vllm/lmdeploy/sglang will handle the logic
             encoded = Template._encode(self, inputs)
-            keys = ['images', 'audios', 'videos', 'points']
+            keys = ['images', 'audios', 'videos']
             if self.mode == 'vllm':
                 keys.append('mm_processor_kwargs')
             for key in keys:
@@ -1300,8 +1297,6 @@ class Template(ProcessorMixin):
                     encoded[key] = value
         else:
             encoded = self._encode(inputs)
-            if inputs.points:
-                encoded['points'] = inputs.points
         input_ids = encoded.get('input_ids')
         labels = encoded.get('labels')
         loss_scale = encoded.get('loss_scale')
@@ -1890,12 +1885,6 @@ class Template(ProcessorMixin):
             grid_thw = self.concat_tensor(batch, f'{media_type}_grid_thw', 0)
             if grid_thw is not None:
                 res[f'{media_type}_grid_thw'] = grid_thw
-        points = [b['points'] for b in batch if b.get('points') is not None]
-        if points:
-            if all(isinstance(point, torch.Tensor) for point in points):
-                res['points'] = torch.stack(points)
-            else:
-                res['points'] = points
         return res
 
     def _sp_data_collator(self, res, padding_to, tokenizer, padding_side):

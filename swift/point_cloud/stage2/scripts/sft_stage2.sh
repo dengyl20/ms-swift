@@ -5,6 +5,7 @@ export POINT_AE_CKPT_PATH=/vast/users/guangyi.chen/causal_group/yunlong.deng/Mul
 # 可选
 export POINT_MAX_INJECT_TOKENS=24
 export POINT_REQUIRE_VALID=1
+export POINTCLOUD_CACHE_PER_RANK=1
 
 MODEL_DIR="/vast/users/guangyi.chen/.cache/huggingface/hub/models--Qwen--Qwen3-Omni-30B-A3B-Instruct/snapshots/26291f793822fb6be9555850f06dfe95f2d7e695" 
 nproc_per_node=4
@@ -13,29 +14,32 @@ NPROC_PER_NODE=$nproc_per_node \
 swift sft \
   --model "${MODEL_DIR}" \
   --model_type qwen3_omni_point \
-  --template qwen3_omni_point \
-  --dataset pointcloud_feature_sft \
+  --template qwen3_omni_point_cloud \
+  --dataset pointcloud_feature_sft#6500 \
   --external_plugins /vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/point_cloud/stage2/src/pc_register.py \
-  --streaming True \
-  --split_dataset_ratio 0 \
+  --streaming False \
+  --split_dataset_ratio 0.01 \
   --remove_unused_columns False \
   --output_dir /vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints \
   --tuner_type full \
   --num_train_epochs 1 \
   --torch_dtype bfloat16 \
-  --per_device_train_batch_size 1 \
-  --per_device_eval_batch_size 1 \
+  --per_device_train_batch_size 4 \
+  --per_device_eval_batch_size 4 \
   --attn_impl flash_attn \
-  --packing true \
+  --packing false \
   --gradient_accumulation_steps 1 \
   --gradient_checkpointing false \
   --logging_steps 5 \
   --warmup_ratio 0.05 \
   --learning_rate 5e-5 \
-  --max_steps 10000 \
   --freeze_llm True \
   --freeze_parameters_regex '^(?!point_ae\.).*' \
   --trainable_parameters_regex '^point_ae\.' \
-  --dataset_num_proc 1 \
-  --dataloader_num_workers 1 \
-  --max_length 64 
+  --dataset_num_proc 8 \
+  --dataloader_num_workers 8 \
+  --strict False 
+  # --max_length 4096
+
+
+  # --max_steps 10000 \

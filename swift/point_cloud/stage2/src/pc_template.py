@@ -1,6 +1,8 @@
 # pc_template.py
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -11,7 +13,9 @@ from swift.point_cloud.stage2.src.pc_constants import DEFAULT_SYSTEM_PROMPT, POI
 
 # ===== 兼容不同 ms-swift 版本导出路径 =====
 from swift.template import Template, TemplateMeta, register_template
+from swift.utils import get_logger, safe_ddp_context
 
+logger = get_logger()
 
 def _as_torch(x: Any) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
@@ -21,18 +25,39 @@ def _as_torch(x: Any) -> torch.Tensor:
     # list -> tensor
     return torch.tensor(x)
 
+def _is_rank0() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
 
 def _get_underlying_model(model: nn.Module) -> nn.Module:
     # 兼容 DDP / wrapper
     if hasattr(model, "module"):
         return model.module  # type: ignore
-    if hasattr(model, "model"):
-        # 注意：不能盲目一直 .model 下去；但大多数 wrapper 是这样
-        try:
-            return model.model  # type: ignore
-        except Exception:
-            pass
     return model
+
+def _stack_if_list(x: Any) -> torch.Tensor:
+    """
+    x 可能是：
+      - Tensor (B, ...)
+      - ndarray
+      - list[Tensor/ndarray/list] (len=B)
+      - list[number] (len=B) 例如 inject_len
+    """
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x)
+
+    if isinstance(x, list):
+        if len(x) == 0:
+            return torch.empty(0)
+        # list of samples -> stack
+        if isinstance(x[0], (torch.Tensor, np.ndarray, list)):
+            return torch.stack([_as_torch(v) for v in x], dim=0)
+        # list of scalars -> tensor
+        return torch.tensor(x)
+
+    # scalar / 其他
+    return torch.tensor(x)
 
 
 class Qwen3OmniPointTemplate(Template):
@@ -41,7 +66,29 @@ class Qwen3OmniPointTemplate(Template):
     - 额外把 point_tokens / text_mask / inject_len collate 出来
     - 在 _post_encode 内：point_tokens -> AE -> token embeds -> 注入 inputs_embeds
     """
-    use_model = True  # 关键：让 ms-swift 在 forward 前调用 _post_encode
+    use_model = True
+
+    @contextmanager
+    def forward_context(self, model: nn.Module, inputs: Dict[str, Any]):
+        """
+        强制在每次 forward 前执行一次 _post_encode，保证 point_ae 真的进入计算图。
+        """
+        # 先保留父类可能做的事情（比如一些 padding/packing 状态管理）
+        with super().forward_context(model, inputs):
+            # 只有当 batch 里还带着 point_tokens 时才做注入（避免重复执行）
+            if "point_tokens" in inputs:
+                if _is_rank0():
+                    logger.info(f"[PC_DEBUG] forward_context(before) keys={list(inputs.keys())}")
+
+                updates = self._post_encode(model, inputs)
+                if updates:
+                    inputs.update(updates)
+
+                if _is_rank0():
+                    logger.info(f"[PC_DEBUG] forward_context(after) keys={list(inputs.keys())}")
+                    if "inputs_embeds" in inputs and isinstance(inputs["inputs_embeds"], torch.Tensor):
+                        logger.info(f"[PC_DEBUG] inputs_embeds.requires_grad={inputs['inputs_embeds'].requires_grad}")
+            yield
 
     def _data_collator_mm_data(self, batch: List[Dict[str, Any]], padding_to: Optional[int] = None) -> Dict[str, Any]:
         res = super()._data_collator_mm_data(batch)
@@ -72,21 +119,27 @@ class Qwen3OmniPointTemplate(Template):
         必须返回可微的 inputs_embeds 注入结果。
         """
         base_model = _get_underlying_model(model)
+        logger.info(inputs.keys())
+        logger.info("**************************************************")
 
         point_tokens = inputs.pop("point_tokens", None)
         text_mask = inputs.pop("text_mask", None)
         inject_len = inputs.pop("inject_len", None)
+        
 
         # 如果 batch 没有点云（不应发生），直接不注入
         if point_tokens is None:
-            return {}
+            raise RuntimeError(
+                "point_tokens is missing in inputs. "
+                "Most likely it was dropped by remove_unused_columns or not propagated by template.encode/dataset."
+            )
 
         if text_mask is None or inject_len is None:
             raise RuntimeError("Missing text_mask/inject_len in batch. Check dataset loader & collator.")
 
         # 找 AE
         if not hasattr(base_model, "point_ae"):
-            raise RuntimeError("Model has no attribute 'point_ae'. Please use model_type=qwen3_omni_point.")
+            raise RuntimeError("Model has no attribute 'point_ae'. Please use model_type=qwen3_omni_point_cloud.")
         point_ae = getattr(base_model, "point_ae")
 
         # tokenizer & point_token_id
@@ -102,8 +155,9 @@ class Qwen3OmniPointTemplate(Template):
         device = emb_layer.weight.device
         dtype = emb_layer.weight.dtype
 
-        point_tokens = point_tokens.to(device=device, dtype=dtype)
-        text_mask = text_mask.to(device=device)
+        point_tokens = _stack_if_list(point_tokens).to(device=device, dtype=dtype)
+        text_mask    = _stack_if_list(text_mask).to(device=device).bool()
+        inject_len   = _stack_if_list(inject_len).to(device=device, dtype=torch.long)
 
         # input_ids 必须在这里用来定位 <point> token
         input_ids = inputs.get("input_ids", None)
@@ -172,7 +226,7 @@ class Qwen3OmniPointTemplate(Template):
 def register_qwen3_omni_point_template(exists_ok: bool = True) -> None:
     register_template(
         TemplateMeta(
-            template_type="qwen3_omni_point",
+            template_type="qwen3_omni_point_cloud",
             # Qwen 系列通用格式（和 ms-swift 内置 qwen 模板一致的风格）
             prefix=[],
             prompt=["<|im_start|>user\n{{QUERY}}<|im_end|>\n<|im_start|>assistant\n"],

@@ -72,7 +72,7 @@ train:
   amp: true
   log_every: 50
 
-  save_dir: "checkpoints/cleaned_maxlen_24"
+  save_dir: "checkpoints/stage1/1"
 
   scheduler:
     type: "cosine"
