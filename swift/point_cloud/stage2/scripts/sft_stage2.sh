@@ -1,5 +1,5 @@
 export POINT_FEATURE_DATASET_INFO_YAML=/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned_24/dataset_info.yaml
-export POINT_CONV_JSON_PATH=/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K_cleaned.json
+export POINT_CONV_JSON_PATH=/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K_filtered.json
 export POINT_AE_CKPT_PATH=/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints/cleaned_maxlen_24/best.pt
 
 # 可选
@@ -15,7 +15,7 @@ swift sft \
   --model "${MODEL_DIR}" \
   --model_type qwen3_omni_point \
   --template qwen3_omni_point_cloud \
-  --dataset pointcloud_feature_sft#6500 \
+  --dataset pointcloud_feature_sft#65000 \
   --external_plugins /vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/point_cloud/stage2/src/pc_register.py \
   --streaming False \
   --split_dataset_ratio 0.01 \
@@ -24,8 +24,8 @@ swift sft \
   --tuner_type full \
   --num_train_epochs 1 \
   --torch_dtype bfloat16 \
-  --per_device_train_batch_size 4 \
-  --per_device_eval_batch_size 4 \
+  --per_device_train_batch_size 16 \
+  --per_device_eval_batch_size 16 \
   --attn_impl flash_attn \
   --packing false \
   --gradient_accumulation_steps 1 \

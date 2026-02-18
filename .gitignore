@@ -5,7 +5,9 @@ data_features/
 data_features_cleaned/
 data_features_cleaned_24/
 caption_length_stats/
-# image_audio_text/
+swift/point_cloud/stage1/src/eval/modelnet40_infer_outputs/
+image_audio_text/
+image_audio_text_2/
 
 # Byte-compiled / optimized / DLL files
 tmp

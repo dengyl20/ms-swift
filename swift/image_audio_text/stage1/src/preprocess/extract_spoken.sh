@@ -11,4 +11,4 @@ export MASTER_PORT=${MASTER_PORT:-$((29500 + RANDOM % 1000))}
 echo "Using MASTER_PORT=$MASTER_PORT"
 
 export MM_CFG="/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/image_audio_text/stage1/configs/extract_spokencoco_features.yaml"
-python -m swift.image_audio_text.stage1.src.preprocess.extract_spoken --config "$MM_CFG"
+torchrun --master_port $MASTER_PORT --nproc_per_node=8 -m swift.image_audio_text.stage1.src.preprocess.extract_spoken --config "$MM_CFG"

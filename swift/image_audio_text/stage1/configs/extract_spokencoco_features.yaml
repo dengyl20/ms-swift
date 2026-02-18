@@ -5,23 +5,77 @@ dataset:
   spokencoco_root: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/spokencoco/SpokenCOCO"
   train_json: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/spokencoco/SpokenCOCO/SpokenCOCO_train.json"
   val_json: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/spokencoco/SpokenCOCO/SpokenCOCO_val.json"
+
   verify_files: true
   skip_missing: true
   max_samples: -1
 
+  # rank0 build manifest 时用的 DataLoader（只拿路径和文本，建议大一点）
+  manifest_batch_size: 2048
+  manifest_num_workers: 4
+
 runtime:
   output_dir: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_spokencoco/1"
   overwrite: false
-  batch_size: 4
-  num_workers: 4
+
+  # 主抽特征 DataLoader
+  batch_size: 32
+  num_workers: 8
   pin_memory: true
+
+  # 保存精度
   save_dtype: "fp16"
+
+  flush_every: 50
   log_every: 20
 
 encoders:
+  # ===== 1) TEXT：完全 follow point_text 逻辑 =====
+  text:
+    model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    tokenizer_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    trust_remote_code: true
+
+    # embedding cache（rank0 会自动生成）
+    embedding_weight_cache: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_spokencoco/1/cache/qwen_embed_weight.pt"
+
+    # 关键：和 point_text 一样，先过滤再进入 FrozenQwenEmbeddingTableFromWeight（truncation=False）
+    max_text_len: 64
+    add_special_tokens: false
+
+    # token_len 过滤的 batch size
+    length_filter_batch_size: 4096
+
+    # 省显存：把 embedding table 放 CPU（强烈推荐）
+    embed_device: "cpu"
+
+    # dtype（抽 embedding weight 时用；支持 auto/fp16/bf16/fp32）
+    dtype: "fp16"
+
+  # ===== 2) IMAGE/AUDIO：用 Thinker 的 get_image_features/get_audio_features =====
   qwen:
     model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-    max_text_len: 64
+    trust_remote_code: true
+    image_audio_weight_cache: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/image_audio_text/stage1/checkpoints/qwen_image_audio_weights.pt"
+    cache_dtype: "fp16"
+    compute_dtype: "fp16"
+    # 关键：不要再 .to(device)，让 HF 自己分配
+    device_map: "auto"
+    dtype: "fp16"
+
+    # token 数（最终会 pad/trunc 到固定长度写入 mmap）
     image_tokens: 256
     audio_tokens: 128
+
+    # ROCm/HIP 通常建议用 sdpa；如果你确定 flash_attention_2 可用再改
+    attn_implementation: "sdpa"
+    max_audio_seconds: 10     # 可选：强烈建议加，显著降低 audio 计算量
+    processor_use_fast: true  # 可选
+distributed:
+  # 单机 8 GPU：如果你用 python 直接运行，会用这个 num_gpus 做 mp.spawn
+  # 如果你用 torchrun 启动，则以 torchrun 的 WORLD_SIZE 为准
+  num_gpus: 8
+  backend: "nccl"
+
+
 

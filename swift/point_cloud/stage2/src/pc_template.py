@@ -77,17 +77,17 @@ class Qwen3OmniPointTemplate(Template):
         with super().forward_context(model, inputs):
             # 只有当 batch 里还带着 point_tokens 时才做注入（避免重复执行）
             if "point_tokens" in inputs:
-                if _is_rank0():
-                    logger.info(f"[PC_DEBUG] forward_context(before) keys={list(inputs.keys())}")
+                # if _is_rank0():
+                #     logger.info(f"[PC_DEBUG] forward_context(before) keys={list(inputs.keys())}")
 
                 updates = self._post_encode(model, inputs)
                 if updates:
                     inputs.update(updates)
 
-                if _is_rank0():
-                    logger.info(f"[PC_DEBUG] forward_context(after) keys={list(inputs.keys())}")
-                    if "inputs_embeds" in inputs and isinstance(inputs["inputs_embeds"], torch.Tensor):
-                        logger.info(f"[PC_DEBUG] inputs_embeds.requires_grad={inputs['inputs_embeds'].requires_grad}")
+                # if _is_rank0():
+                #     logger.info(f"[PC_DEBUG] forward_context(after) keys={list(inputs.keys())}")
+                #     if "inputs_embeds" in inputs and isinstance(inputs["inputs_embeds"], torch.Tensor):
+                #         logger.info(f"[PC_DEBUG] inputs_embeds.requires_grad={inputs['inputs_embeds'].requires_grad}")
             yield
 
     def _data_collator_mm_data(self, batch: List[Dict[str, Any]], padding_to: Optional[int] = None) -> Dict[str, Any]:
@@ -119,8 +119,6 @@ class Qwen3OmniPointTemplate(Template):
         必须返回可微的 inputs_embeds 注入结果。
         """
         base_model = _get_underlying_model(model)
-        logger.info(inputs.keys())
-        logger.info("**************************************************")
 
         point_tokens = inputs.pop("point_tokens", None)
         text_mask = inputs.pop("text_mask", None)
