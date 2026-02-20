@@ -1,38 +1,31 @@
-
 # -*- coding: utf-8 -*-
 """
-infer_modelnet40_point_ae_qwen3_omni.py
+infer_modelnet40_point_mlp_qwen3_omni.py
 
 用途：
 - 在 ModelNet40 特征数据集（只含 point_tokens + object_labels）上做推理
-- 用你训练好的 UnifiedPointTextAE 将 point_tokens 映射为“文本模态 token embedding”
+- 用你从 baseline LLM checkpoint 提取出来的 point_projector（mlp2x_gelu）将 point_tokens 映射为 “文本 token embedding”
 - 将 embedding 注入到 Qwen3-Omni 的 <point> 占位 token 位置
 - 任务：ModelNet40 40 分类（输出一个 label）
-- baseline：仍用旧版 caption prompt（看看会输出什么），结果另存一份文件
+- 同样额外跑一个“旧 caption prompt baseline”（可选，输出另存一份文件）——逻辑与 AE 推理脚本一致
 
-多进程/多 rank 推理（你当前的需求）：
+多进程/多 rank 推理：
 - 单卡放不下模型，2 卡放一个推理副本
 - 单节点 8 卡 => 4 个 rank 并行推理（每 rank 2 卡）
 
 推荐启动方式（单节点）：
-  GPUS_PER_RANK=2 torchrun --nproc_per_node=4 infer_modelnet40_point_ae_qwen3_omni.py
+  GPUS_PER_RANK=2 torchrun --nproc_per_node=4 infer_modelnet40_point_mlp_qwen3_omni.py
 
-符合你的改动要求：
-1) 仅两种取样方式：顺序前 N 个，或全量
-2) 不处理 text_embeds/text_mask（新数据集没有）
-3) 不比较旧 baseline（只跑“我的方法” + 新增的“旧 prompt baseline”）
-4) 注入 token 数量由一个超参数固定（FIXED_NUM_POINT_TOKENS）
-5) 保留 Top-K token proxy（重构 token 最像哪些词）
-6) prompt 修改为 40 分类；另做 baseline：旧 prompt（caption）并保存到另一文件
-7) 不使用 argparse，全部全局变量
+注意：
+- 本脚本不使用 argparse，全部全局变量配置（对齐你 AE 脚本）。
 """
 
 from __future__ import annotations
 
 # ============================================================
-# 重要：如果用 torchrun 多进程并行，每个 rank 需要只“看到”自己的 2 张卡，
+# 重要：torchrun 多进程并行时，每个 rank 只“看到”自己的 2 张卡，
 #      这样 Transformers 的 device_map="auto" 才会在这 2 张卡内做模型并行。
-#      这里必须在 import torch/transformers 之前设置 CUDA_VISIBLE_DEVICES。
+#      必须在 import torch/transformers 之前设置 CUDA_VISIBLE_DEVICES。
 # ============================================================
 
 import os
@@ -70,13 +63,11 @@ def _auto_set_cuda_visible_devices_for_mp() -> None:
     start = local_rank * gpus_per_rank
     end = start + gpus_per_rank
 
-    # 若外部已过滤可见 GPU，则在其内部切片
     vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     vis_list = [x.strip() for x in vis.split(",") if x.strip() != ""]
     if len(vis_list) >= end:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(vis_list[start:end])
     else:
-        # 否则假设是物理连续编号
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(start, end))
 
 
@@ -85,19 +76,18 @@ _auto_set_cuda_visible_devices_for_mp()
 import json
 import random
 import re
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 
 # ====== OFFLINE MODE（按你旧脚本保持）======
 os.environ["HF_HUB_OFFLINE"] = "1"
 
-# ====== 你的模块（保持与训练脚本一致的 import 路径）======
-from swift.point_cloud.stage1.src.models.unified_ae import UnifiedPointTextAE
+# ====== 你的数据集（保持与 AE 推理脚本一致的 import 路径）======
 from swift.point_cloud.stage1.src.eval.modelnet40_dataset import ModelNet40PointTokenDataset
 
 # ====== Qwen3-Omni (Transformers) ======
@@ -175,14 +165,13 @@ def _rule(title: str = "") -> None:
 # ============================================================
 
 # ---------- Multi-process / distributed ----------
-# 每个 rank 2 张卡（模型并行），单节点 8 卡 => torchrun --nproc_per_node=4
-# 注：CUDA_VISIBLE_DEVICES 的按-rank 切片发生在文件顶部（import torch 之前），默认读取环境变量 GPUS_PER_RANK=2
 GPUS_PER_RANK = int(os.environ.get("GPUS_PER_RANK", "2"))
 PRINT_ONLY_RANK0 = True
 MERGE_RANK_SHARDS_TO_SINGLE_JSONL = True
 
-# ---------- 必改：你的 AE checkpoint ----------
-AE_CKPT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints/v100-20260215-045054/point_ae_finetuned_checkpoint-1006.pt"
+# ---------- 必改：你提取出来的 projector checkpoint ----------
+# 由 extract_point_projector_from_swift_ckpt.py 输出
+PROJECTOR_CKPT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints_mlp/v1-20260218-055502/point_projector_finetuned_checkpoint.pt"
 
 # ---------- 必改：ModelNet40 特征 pt ----------
 MODELNET40_FEATURE_PT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/modelnet40_gray_color.pt"
@@ -191,8 +180,6 @@ MODELNET40_FEATURE_PT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng
 QWEN_MODEL_NAME_OR_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 # ---------- 取样方式（仅两种） ----------
-# "first_n": 顺序取前 N 个样本（从 START_INDEX 开始）
-# "all":     全量样本（从 START_INDEX 到末尾）
 SAMPLE_MODE = "all"  # "first_n" | "all"
 START_INDEX = 0
 NUM_SAMPLES = 10  # SAMPLE_MODE="first_n" 时生效
@@ -203,13 +190,8 @@ REQUIRE_VALID = False
 # ---------- 注入相关 ----------
 POINT_PLACEHOLDER = "<point>"
 
-# 你要求的：固定注入 token 数（不再依赖 text_mask）
+# 固定注入 token 数（与 AE 脚本一致）
 FIXED_NUM_POINT_TOKENS = 8
-
-# AE forward 需要一个 text_feat + text_mask 的“dummy 形状”，这里决定 dummy 的总长度
-# - 若 None：尝试从 AE ckpt cfg 推断；推断不到则用 max(FIXED_NUM_POINT_TOKENS, 16)
-# - 若你运行报 shape 相关错误，可手动设为训练时的 text token 总长度（例如 256/512）
-AE_DUMMY_TEXT_TOTAL_LEN: Optional[int] = None
 
 # ---------- 生成超参数 ----------
 MAX_NEW_TOKENS = 64
@@ -218,7 +200,7 @@ TEMPERATURE = 0.7
 TOP_P = 0.9
 
 # ---------- 输出文件 ----------
-OUTPUT_DIR = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/point_cloud/stage1/src/eval/modelnet40_infer_outputs"
+OUTPUT_DIR = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/point_cloud/stage1/src/eval/results/modelnet40_mlp_projector"
 OUT_MAIN_JSONL = os.path.join(OUTPUT_DIR, "predictions_modelnet40_cls.jsonl")
 OUT_BASELINE_JSONL = os.path.join(OUTPUT_DIR, "predictions_baseline_caption_prompt.jsonl")
 OUT_METRICS_JSON = os.path.join(OUTPUT_DIR, "metrics_modelnet40_cls_summary.json")
@@ -226,22 +208,20 @@ OVERWRITE_OUTPUT_FILES = True  # True: 覆盖写；False: 追加
 
 # ---------- 打印/调试 ----------
 VERBOSE_PRINT_PER_SAMPLE = True
-PRINT_EVERY = 1  # 每隔多少条打印一次（全量推理时建议调大）
+PRINT_EVERY = 1
 
 DEBUG_SHOW_INJECTION_DEBUG = True
 DEBUG_MAX_SHOW_SPANS = 12
 DEBUG_SHOW_TOPK_TOKEN_PROXIES = True
 DEBUG_TOPK_TOKENS = 6
-
-# 为了节省算力：只对前多少条样本做 token proxy（全量推理建议设小点；设 None 表示全做）
 DEBUG_ONLY_FIRST_N_FOR_TOKEN_PROXY: Optional[int] = 10
 
 # ---------- 随机种子 ----------
 SEED = 42
 
+
 # ============================================================
 # 1) Prompt（主任务：40 分类；baseline：旧 caption prompt）
-# 注意：system prompt 中不要出现字面 "<point>"（避免 tokenizer 生成额外占位 token）
 # ============================================================
 
 SYSTEM_PROMPT_CLS = (
@@ -256,7 +236,6 @@ SYSTEM_PROMPT_CLS = (
     "- Output only the label string, no extra words, no punctuation, no JSON.\n"
 )
 
-# baseline：沿用你旧脚本的 system prompt（caption/QA 风格）
 SYSTEM_PROMPT_OLD_CAPTION = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of understanding text inputs "
     "and generating helpful responses.\n\n"
@@ -319,8 +298,6 @@ def to_device_dtype(x: torch.Tensor, device: torch.device, dtype: torch.dtype) -
 def build_user_prompt_with_points_cls(labels: List[str], k: int, placeholder: str = "<point>") -> str:
     k = max(1, int(k))
     point_block = " ".join([placeholder] * k)
-
-    # 把 label list 写成稳定格式，尽量减少模型“自造类别名”
     label_lines = "\n".join([f"- {x}" for x in labels])
 
     return (
@@ -334,7 +311,6 @@ def build_user_prompt_with_points_cls(labels: List[str], k: int, placeholder: st
 
 
 def build_user_prompt_with_points_old_caption(k: int, placeholder: str = "<point>") -> str:
-    # 尽量保持你旧 prompt 结构（3D_POINT_CLOUD_EMBEDDING / QUESTION / ANSWER）
     k = max(1, int(k))
     point_block = " ".join([placeholder] * k)
     q = "Describe the object represented by the 3D point cloud in one short sentence."
@@ -354,10 +330,6 @@ def _normalize_pred_text_for_label(text: str) -> str:
 
 
 def is_strict_one_label_answer(text: str, label_set: set) -> Tuple[bool, Optional[str]]:
-    """
-    “按格式回答”的严格定义：
-    - 输出去掉首尾空白与引号后，必须 EXACTLY 等于某个 label（不允许额外词/标点/解释）
-    """
     if text is None:
         return False, None
     t = _normalize_pred_text_for_label(text)
@@ -367,19 +339,12 @@ def is_strict_one_label_answer(text: str, label_set: set) -> Tuple[bool, Optiona
 
 
 def parse_modelnet40_label(text: str, label_set: set) -> Optional[str]:
-    """
-    从模型输出中解析 label（更鲁棒一点）：
-    - 优先：输出整体等于某个 label
-    - 否则：在输出中找最先出现的 label 子串（按 word boundary-ish 匹配）
-    """
     if text is None:
         return None
     t = _normalize_pred_text_for_label(text)
     if t in label_set:
         return t
 
-    # 常见格式：Label: chair / The object is chair / chair.
-    # 用“非 [a-z0-9_]”做边界，兼容下划线 label
     best = None
     best_pos = 10**9
     for lab in label_set:
@@ -392,101 +357,125 @@ def parse_modelnet40_label(text: str, label_set: set) -> Optional[str]:
 
 
 # ============================================================
-# 3) 加载 AE
+# 3) 加载 projector ckpt
 # ============================================================
 
-def load_ae_from_ckpt(ckpt_path: str, device: torch.device, dtype: torch.dtype) -> Tuple[UnifiedPointTextAE, Dict[str, Any]]:
+def _build_mlp2x_gelu(in_dim: int, out_dim: int) -> nn.Module:
+    return nn.Sequential(
+        nn.Linear(in_dim, out_dim, bias=True),
+        nn.GELU(),
+        nn.Linear(out_dim, out_dim, bias=True),
+    )
+
+
+def _infer_in_out_dim_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Tuple[int, int]:
+    # 兼容你抽取脚本的默认格式（'0.weight'）
+    if "0.weight" in state_dict:
+        w0 = state_dict["0.weight"]
+        if w0.dim() != 2:
+            raise RuntimeError(f"Expected '0.weight' to be 2D, got shape={tuple(w0.shape)}")
+        out_dim = int(w0.shape[0])
+        in_dim = int(w0.shape[1])
+        return in_dim, out_dim
+
+    # fallback：找一个二维 weight
+    cand = [(k, v) for k, v in state_dict.items() if isinstance(v, torch.Tensor) and v.dim() == 2 and k.endswith("weight")]
+    if not cand:
+        raise RuntimeError("Cannot infer dims from projector state_dict: no 2D weight found.")
+    k, w = cand[0]
+    return int(w.shape[1]), int(w.shape[0])
+
+
+def load_projector_from_ckpt(
+    ckpt_path: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    ckpt 结构来自你的训练脚本保存：
-      ckpt = {"cfg": cfg, "model": state_dict, ...}
+    读取 extract_point_projector_from_swift_ckpt.py 输出的 ckpt：
+      ckpt = {"cfg": {"model": {...}}, "model": state_dict, ...}
     """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = ckpt.get("cfg", None)
-    if cfg is None:
-        raise RuntimeError(f"Checkpoint missing 'cfg': {ckpt_path}")
-    model_cfg = cfg.get("model", None)
-    if model_cfg is None:
-        raise RuntimeError(f"Checkpoint cfg missing 'model': {ckpt_path}")
+    cfg = ckpt.get("cfg", {}) or {}
+    model_cfg = cfg.get("model", {}) or {}
 
-    ae = UnifiedPointTextAE(model_cfg)
-    ae.load_state_dict(ckpt["model"], strict=True)
-    ae.eval()
-    ae.to(device=device, dtype=dtype)
-    return ae, cfg
+    state_dict = ckpt.get("model", None)
+    if state_dict is None:
+        # 兼容其它命名
+        state_dict = ckpt.get("state_dict", None)
+    if state_dict is None or not isinstance(state_dict, dict):
+        raise RuntimeError(f"Projector ckpt missing 'model' (state_dict dict): {ckpt_path}")
 
+    arch = str(model_cfg.get("arch", "mlp2x_gelu"))
+    in_dim = model_cfg.get("in_dim", None)
+    out_dim = model_cfg.get("out_dim", None)
 
-def infer_ae_text_total_len_from_cfg(ae_cfg: Dict[str, Any], default_len: int) -> int:
-    """
-    尝试从 ae_cfg["model"] 推断 text 序列总长度（dummy text_feat 的 L）。
-    推断失败就用 default_len。
-    """
-    model_cfg = ae_cfg.get("model", {})
-    # 常见字段名做一圈尝试（不保证都有）
-    candidates = [
-        "max_text_len",
-        "text_max_len",
-        "max_len",
-        "text_len",
-        "n_text_tokens",
-        "num_text_tokens",
-        "L_text",
-        "l_text",
-    ]
-    for k in candidates:
-        if k in model_cfg:
-            try:
-                v = int(model_cfg[k])
-                if v > 0:
-                    return v
-            except Exception:
-                pass
-    return int(default_len)
+    if in_dim is None or out_dim is None:
+        in_dim_i, out_dim_i = _infer_in_out_dim_from_state_dict(state_dict)
+        in_dim = in_dim_i
+        out_dim = out_dim_i
+
+    in_dim = int(in_dim)
+    out_dim = int(out_dim)
+
+    if arch != "mlp2x_gelu":
+        # 目前 baseline 的 pc_model.py 明确是 mlp2x_gelu；若你未来改结构，可在此扩展
+        _p(f"[WARN] cfg.model.arch={arch} (expected 'mlp2x_gelu'). Will still build mlp2x_gelu and try to load.",
+           style="yellow" if _console is not None else None)
+
+    proj = _build_mlp2x_gelu(in_dim, out_dim)
+    missing, unexpected = proj.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        # 推理阶段更倾向于直接报错（避免 silent wrong）
+        raise RuntimeError(
+            "Projector state_dict mismatch when loading.\n"
+            f"missing: {missing}\n"
+            f"unexpected: {unexpected}\n"
+            f"ckpt={ckpt_path}\n"
+            "If you changed projector architecture, update loader accordingly."
+        )
+
+    proj.eval()
+    proj.to(device=device, dtype=dtype)
+    return proj, cfg
 
 
 @torch.no_grad()
-def ae_point_to_text_token_embeddings_fixed(
+def projector_point_to_text_token_embeddings_fixed(
     *,
-    ae: UnifiedPointTextAE,
+    projector: nn.Module,
     point_tokens: torch.Tensor,   # (T,D)
-    llm_hidden: int,              # H
     fixed_k: int,                 # K
-    dummy_total_len: int,         # L_total
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
-    在没有 text_embeds/text_mask 的情况下：
-    - 构造 dummy text_feat: (1, L_total, H) 全 0
-    - 构造 text_mask: 前 K 个 True，其余 False
-    - 得到 out["text_recon_from_point"]: (1, L_total, H)
-    - 返回：
-        pred_seq: (K, H)   （用于注入）
-        pred_all: (L_total, H) （调试备用）
-        mask_all: (L_total,) bool
+    baseline projector 推理：
+      (T,D) -> (T,H) -> 取前 K；若 T < K 则 pad（复制最后一个 token，保持与 template 防御一致）
+    返回：pred_seq (K,H)
     """
     fixed_k = int(fixed_k)
-    dummy_total_len = int(dummy_total_len)
     if fixed_k <= 0:
         raise ValueError(f"fixed_k must be > 0, got {fixed_k}")
-    if dummy_total_len < fixed_k:
-        raise ValueError(f"dummy_total_len ({dummy_total_len}) must be >= fixed_k ({fixed_k})")
 
     pt = to_device_dtype(point_tokens.unsqueeze(0), device, dtype)  # (1,T,D)
+    projected = projector(pt)  # (1,T,H) (期望)
 
-    # dummy text tokens: (1, L_total, H)
-    te = torch.zeros((1, dummy_total_len, llm_hidden), device=device, dtype=dtype)
+    if projected.dim() != 3:
+        raise RuntimeError(f"projector output must be (B,T,H), got shape={tuple(projected.shape)}")
 
-    mask = torch.zeros((dummy_total_len,), device=device, dtype=torch.bool)
-    mask[:fixed_k] = True
-    tm = mask.unsqueeze(0)  # (1,L_total)
+    seq = projected[0]  # (T,H)
+    T = int(seq.shape[0])
+    H = int(seq.shape[1])
 
-    out = ae(point_feat=pt, text_feat=te, text_mask=tm)
-    if "text_recon_from_point" not in out:
-        raise RuntimeError("AE forward output missing key: 'text_recon_from_point'")
+    if T < fixed_k:
+        if T == 0:
+            seq = torch.zeros((fixed_k, H), device=device, dtype=dtype)
+        else:
+            pad = seq[-1:].expand(fixed_k - T, -1)
+            seq = torch.cat([seq, pad], dim=0)
 
-    pred_all = out["text_recon_from_point"][0]  # (L_total, H)
-    pred_seq = pred_all[mask]                  # (K, H)
-    return pred_seq, pred_all, mask
+    return seq[:fixed_k]
 
 
 # ============================================================
@@ -546,11 +535,6 @@ def inject_point_embeddings_into_inputs_embeds(
     point_embeddings: torch.Tensor,  # (K, H)
     point_placeholder: str = "<point>",
 ) -> Tuple[torch.Tensor, List[Tuple[int, int]], List[Tuple[str, List[int]]]]:
-    """
-    基于“<point> 作为一个单独 special token（1 token）”的注入逻辑：
-    - 找到 input_ids 中所有 <point> token_id 的位置
-    - 用 point_embeddings[i] 替换对应位置 embedding（每个 <point> 替换 1 个 token）
-    """
     new_embeds = inputs_embeds.clone()
     H = new_embeds.shape[-1]
 
@@ -844,7 +828,7 @@ def greedy_fallback_generate(
 
 
 # ============================================================
-# 5) I/O：写 JSONL
+# 5) I/O：写 JSONL（与 AE 脚本一致）
 # ============================================================
 
 def ensure_dir(path: str) -> None:
@@ -873,10 +857,6 @@ def merge_jsonl_shards(
     overwrite: bool,
     sort_key: Tuple[str, str] = ("run_i", "ds_idx"),
 ) -> None:
-    """
-    合并多个 rank 产出的 jsonl shard 到单个文件。
-    默认按 (run_i, ds_idx) 排序，尽量恢复原先单进程的行顺序。
-    """
     records: List[Dict[str, Any]] = []
     for sp in shard_paths:
         if not os.path.exists(sp):
@@ -941,19 +921,14 @@ def main() -> None:
     ds = ModelNet40PointTokenDataset(MODELNET40_FEATURE_PT_PATH, require_valid=REQUIRE_VALID)
     n_total = len(ds)
 
-    # 仅两种取样方式
     if SAMPLE_MODE == "first_n":
         end = min(n_total, START_INDEX + int(NUM_SAMPLES))
         indices = list(range(int(START_INDEX), int(end)))
-        # 改为：从 [START_INDEX, n_total) 中随机无放回采样 NUM_SAMPLES 个
-        # candidate_indices = list(range(int(START_INDEX), int(n_total)))
-        # indices = random.sample(candidate_indices, int(NUM_SAMPLES))
     elif SAMPLE_MODE == "all":
         indices = list(range(int(START_INDEX), int(n_total)))
     else:
         raise ValueError(f"Unknown SAMPLE_MODE={SAMPLE_MODE}, must be 'first_n' or 'all'.")
 
-    # labels 列表（尽量用数据集中的实际 label 拼写）
     labels = sorted({ds[i]["object_labels"] for i in range(n_total)})
     label_set = set(labels)
     label_to_idx = {lab: i for i, lab in enumerate(labels)}
@@ -983,7 +958,6 @@ def main() -> None:
     )
     if num_added > 0:
         model.resize_token_embeddings(len(tokenizer))
-        # 初始化新 token embedding：用旧分词的平均 embedding 做个稳定初始化
         try:
             point_id_new = int(tokenizer.convert_tokens_to_ids(POINT_PLACEHOLDER))
             emb_tmp = model.get_input_embeddings()
@@ -1010,26 +984,20 @@ def main() -> None:
         _p(f"[INFO] LLM embedding device={emb_device}, dtype={emb_dtype}, hidden={llm_hidden}",
            style="green" if _console is not None else None)
 
-    # ---- AE ----
-    ae, ae_cfg = load_ae_from_ckpt(AE_CKPT_PATH, device=emb_device, dtype=emb_dtype)
+    # ---- projector ----
+    projector, proj_cfg = load_projector_from_ckpt(PROJECTOR_CKPT_PATH, device=emb_device, dtype=emb_dtype)
 
-    ae_d_text_in = int(ae_cfg.get("model", {}).get("d_text_in", -1))
-    if ae_d_text_in != -1 and ae_d_text_in != llm_hidden and _is_main_process():
+    proj_model_cfg = (proj_cfg.get("model", {}) if isinstance(proj_cfg, dict) else {}) or {}
+    proj_out_dim = int(proj_model_cfg.get("out_dim", llm_hidden))
+    if proj_out_dim != llm_hidden and _is_main_process():
         _p(
-            f"[WARN] Dimension mismatch: AE d_text_in={ae_d_text_in} vs LLM hidden={llm_hidden}. "
-            f"Injection may fail unless you have a projection.",
+            f"[WARN] Dimension mismatch: projector out_dim={proj_out_dim} vs LLM hidden={llm_hidden}. "
+            f"Injection will likely fail unless you have another projection.",
             style="yellow" if _console is not None else None,
         )
 
-    # dummy total len 决策
-    default_len = max(int(FIXED_NUM_POINT_TOKENS), 16)
-    inferred_len = infer_ae_text_total_len_from_cfg(ae_cfg, default_len=default_len)
-    dummy_total_len = int(AE_DUMMY_TEXT_TOTAL_LEN) if AE_DUMMY_TEXT_TOTAL_LEN is not None else int(inferred_len)
-    if dummy_total_len < FIXED_NUM_POINT_TOKENS:
-        dummy_total_len = int(FIXED_NUM_POINT_TOKENS)
-
     if _is_main_process():
-        _p(f"[INFO] FIXED_NUM_POINT_TOKENS={FIXED_NUM_POINT_TOKENS}, AE_DUMMY_TEXT_TOTAL_LEN={dummy_total_len}",
+        _p(f"[INFO] FIXED_NUM_POINT_TOKENS={FIXED_NUM_POINT_TOKENS}",
            style="green" if _console is not None else None)
 
     # ---- token proxy 预计算 ----
@@ -1044,7 +1012,6 @@ def main() -> None:
     # ---- 输出文件 ----
     ensure_dir(OUTPUT_DIR)
 
-    # 多进程时每个 rank 写自己的 shard，最后 rank0 合并到原始文件名
     out_main_rank = add_rank_suffix(OUT_MAIN_JSONL, rank) if is_distributed else OUT_MAIN_JSONL
     out_base_rank = add_rank_suffix(OUT_BASELINE_JSONL, rank) if is_distributed else OUT_BASELINE_JSONL
 
@@ -1075,7 +1042,6 @@ def main() -> None:
     parsed_count = 0
 
     for run_i, ds_idx in enumerate(indices):
-        # 简单的按-rank 切分：run_i % world_size
         if is_distributed and ((run_i % world_size) != rank):
             continue
 
@@ -1089,27 +1055,24 @@ def main() -> None:
         if gt_li is not None:
             per_label_total[gt_li] += 1
 
-        # 1) AE: point -> text token embeddings (K,H)
+        # 1) projector: point -> token embeddings (K,H)
         try:
-            pred_seq, pred_all, mask_all = ae_point_to_text_token_embeddings_fixed(
-                ae=ae,
+            pred_seq = projector_point_to_text_token_embeddings_fixed(
+                projector=projector,
                 point_tokens=point_tokens,
-                llm_hidden=llm_hidden,
                 fixed_k=int(FIXED_NUM_POINT_TOKENS),
-                dummy_total_len=int(dummy_total_len),
                 device=emb_device,
                 dtype=emb_dtype,
             )
         except Exception as e:
-            # 写入失败记录，继续
             rec_fail = {
                 "ds_idx": int(ds_idx),
                 "run_i": int(run_i),
                 "gt_label": gt_label,
-                "error": f"AE_forward_failed: {repr(e)}",
+                "error": f"projector_forward_failed: {repr(e)}",
             }
             write_jsonl_line(f_main, rec_fail)
-            write_jsonl_line(f_base, {**rec_fail, "error": f"AE_forward_failed: {repr(e)}"})
+            write_jsonl_line(f_base, {**rec_fail, "error": f"projector_forward_failed: {repr(e)}"})
             continue
 
         K = int(pred_seq.shape[0])
@@ -1140,7 +1103,6 @@ def main() -> None:
                 "error": f"injection_failed: {repr(e)}",
             }
             write_jsonl_line(f_main, rec_fail)
-            # baseline 也写一下失败原因（因为同一套注入，极可能也失败）
             write_jsonl_line(f_base, {**rec_fail, "error": f"injection_failed: {repr(e)}"})
             continue
 
@@ -1157,7 +1119,6 @@ def main() -> None:
                 top_p=TOP_P,
             )
         except Exception as e:
-            # fallback
             try:
                 pred_text = greedy_fallback_generate(
                     model=model,
@@ -1190,10 +1151,8 @@ def main() -> None:
                 correct_local += 1
                 if gt_li is not None:
                     per_label_correct[gt_li] += 1
-
                 correct += 1
 
-        # 写主结果
         rec_main = {
             "ds_idx": int(ds_idx),
             "run_i": int(run_i),
@@ -1232,7 +1191,6 @@ def main() -> None:
                 top_p=TOP_P,
             )
         except Exception as e:
-            # baseline 不强求 fallback，简单记录
             cap_text = f"[baseline_caption_failed: {repr(e)}]"
             spans_cap, patterns_cap = [], []
 
@@ -1265,7 +1223,6 @@ def main() -> None:
             else:
                 _p(f"[INFO] gt={gt_label}  pred_label={pred_label}  correct={is_correct}  format_ok={fmt_ok}")
 
-            # 注入定位 & token proxy（只用分类 prompt 的 spans_cls）
             if DEBUG_SHOW_INJECTION_DEBUG:
                 if _console is not None:
                     dbg = Table(title="Injection Locate Result (CLS prompt)", box=box.SIMPLE, show_header=False)
@@ -1276,13 +1233,12 @@ def main() -> None:
                     _p(f"[DEBUG] spans(len={len(spans_cls)}): {spans_cls[:10]}{' ...' if len(spans_cls) > 10 else ''}")
                     _p(f"[DEBUG] patterns: {patterns_cls}")
 
-                # 只对前 N 条做 token proxy（节省算力）
                 allow_proxy = DEBUG_SHOW_TOPK_TOKEN_PROXIES
                 if DEBUG_ONLY_FIRST_N_FOR_TOKEN_PROXY is not None and run_i >= int(DEBUG_ONLY_FIRST_N_FOR_TOKEN_PROXY):
                     allow_proxy = False
 
                 render_injection_debug(
-                    label="AE(text_recon_from_point) -> CLS prompt",
+                    label="Projector(mlp2x_gelu) -> CLS prompt",
                     tokenizer=tokenizer,
                     input_ids=input_ids_cls,
                     base_embeds=base_embeds_cls,
@@ -1296,7 +1252,6 @@ def main() -> None:
                     topk=DEBUG_TOPK_TOKENS,
                 )
 
-            # prompts
             if _console is not None:
                 _console.print(Panel(user_cls, title="User Prompt (CLS)", border_style="cyan", expand=False))
                 _console.print(Panel(user_cap, title="User Prompt (Baseline old caption)", border_style="magenta", expand=False))
@@ -1304,7 +1259,6 @@ def main() -> None:
                 _p("User Prompt (CLS):\n" + user_cls)
                 _p("User Prompt (Baseline old caption):\n" + user_cap)
 
-            # outputs
             if _console is not None:
                 out_tb = Table(title="Outputs", box=box.SIMPLE_HEAVY)
                 out_tb.add_column("Variant", style="bold", justify="left")
@@ -1318,7 +1272,6 @@ def main() -> None:
                 _p("Baseline (old caption prompt):\n" + cap_text)
                 _p("GT label:\n" + gt_label)
 
-    # ---- done ----
     f_main.close()
     f_base.close()
 
@@ -1354,7 +1307,6 @@ def main() -> None:
         per_label_correct_all = _all_reduce_list(per_label_correct)
         per_label_format_ok_all = _all_reduce_list(per_label_format_ok)
 
-    # 确保所有 rank 写完 shard 文件再合并
     dist_barrier()
 
     # ---- rank0 合并 shard ----
@@ -1420,7 +1372,6 @@ def main() -> None:
                 "format_ok_ratio": (fok / tot) if tot > 0 else None,
             }
 
-        # 保存 metrics
         try:
             with open(OUT_METRICS_JSON, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -1428,7 +1379,6 @@ def main() -> None:
         except Exception as e:
             _p(f"[WARN] Failed to write metrics json: {repr(e)}", style="yellow" if _console is not None else None)
 
-        # 终端输出（总体）
         _p(
             f"[INFO] Total={total} | Correct={correct_n} | Acc={acc:.6f} | "
             f"FormatOK={fmt_n} ({fmt_ratio:.6f}) | Parsed={parsed} ({parsed_ratio:.6f}) | "
@@ -1436,7 +1386,6 @@ def main() -> None:
             style="green" if _console is not None else None,
         )
 
-        # 每个 label 的正确率分布
         if _console is not None:
             tb = Table(title="Per-label Accuracy (counted over ALL samples; unparsed/errors => incorrect)", box=box.SIMPLE_HEAVY)
             tb.add_column("label", justify="left", style="bold")
@@ -1479,7 +1428,6 @@ def main() -> None:
                     f"format_ok={m['format_ok_ratio'] if m['format_ok_ratio'] is not None else 'n/a'}"
                 )
 
-        # 输出文件路径（合并后的主文件名优先）
         if is_distributed and MERGE_RANK_SHARDS_TO_SINGLE_JSONL:
             _p(f"[INFO] Saved:\n  - {OUT_MAIN_JSONL}\n  - {OUT_BASELINE_JSONL}\n  - {OUT_METRICS_JSON}",
                style="green" if _console is not None else None)
@@ -1487,7 +1435,6 @@ def main() -> None:
             _p(f"[INFO] Saved:\n  - {out_main_rank}\n  - {out_base_rank}\n  - {OUT_METRICS_JSON}",
                style="green" if _console is not None else None)
 
-    # 释放 process group
     if dist.is_available() and dist.is_initialized():
         dist_barrier()
         dist.destroy_process_group()

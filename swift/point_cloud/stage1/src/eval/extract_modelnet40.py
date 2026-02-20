@@ -26,14 +26,18 @@ SEED = 1234
 MODELNET40_PICKLE_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/modelnet40_test_8192pts_fps.dat"
 
 # 输出特征文件（.pt）
-OUTPUT_FEATURE_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/modelnet40_test_point_tokens.pt"
+OUTPUT_FEATURE_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/modelnet40_gray_color.pt"
 
 # 点云基本设置
 POINT_NUM = 8192
-POINT_DIMS = 6              # 你的数据是 [x y z nx ny nz]
-NORMALIZE_PC = False         # 是否对 xyz 做 pc_norm（中心化+unit sphere）
+POINT_DIMS = 6              # 你的数据是 [x y z r g b]
+NORMALIZE_PC = True         # 是否对 xyz 做 pc_norm（中心化+unit sphere）
 ON_ERROR = "raise"           # "zero" | "raise"
 MAX_SAMPLES = -1            # >0 则只处理前 N 个（debug）
+
+# 颜色设置：将随机 RGB 统一替换为固定颜色（中性灰），避免误导冻结的 point encoder
+# - 按 [0,1] 填充 fixed_rgb_01（默认 0.5）
+FIXED_RGB_01: Tuple[float, float, float] = (0.5, 0.5, 0.5)
 
 # 推理设置
 BATCH_SIZE = 32
@@ -156,6 +160,25 @@ def pc_norm_np(pc: np.ndarray) -> np.ndarray:
     return out
 
 
+def replace_random_rgb_with_fixed(pc: np.ndarray, fixed_rgb_01: Tuple[float, float, float] = FIXED_RGB_01) -> np.ndarray:
+    """
+    pc: (N,6) with [x y z r g b] (or last 3 dims as RGB-like attributes)
+    将后三维统一替换为固定颜色，避免随机颜色误导冻结的 point encoder。
+      - 否则              => 视为 [0,1]，直接填 fixed_rgb_01（默认 0.5）
+    """
+    if pc.ndim != 2 or pc.shape[1] < 6:
+        return pc
+
+    rgb = pc[:, 3:6]
+    vmax = float(np.max(rgb))
+    vmin = float(np.min(rgb))
+
+    fill = np.asarray(fixed_rgb_01, dtype=np.float32).reshape(3,)
+
+    pc[:, 3:6] = fill[None, :]
+    return pc
+
+
 def parse_save_dtype(s: str) -> torch.dtype:
     s = (s or "fp16").lower()
     if s in ("fp16", "float16", "half"):
@@ -234,6 +257,11 @@ class ModelNet40PickleDataset(Dataset):
 
             if not np.isfinite(pc).all():
                 pc = np.nan_to_num(pc, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+            # ==========================
+            # 去掉随机颜色：RGB 置为固定值
+            # ==========================
+            pc = replace_random_rgb_with_fixed(pc)
 
         except Exception as e:
             valid = False
@@ -419,4 +447,20 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+
+    with open(MODELNET40_PICKLE_PATH, "rb") as f:
+        points_list, labels_list = pickle.load(f)
+
+    new_points_list = []
+    for pts in points_list:
+        pc = np.asarray(pts, dtype=np.float32).copy()   # copy 很关键，避免引用原内存
+        pc = replace_random_rgb_with_fixed(pc)
+        new_points_list.append(pc)
+
+    new_path = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/modelnet40_gray.dat"
+    with open(new_path, "wb") as f:
+        pickle.dump((new_points_list, labels_list), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print("saved fixed dataset to:", new_path)
+
     main()

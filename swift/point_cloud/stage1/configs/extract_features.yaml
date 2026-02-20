@@ -1,7 +1,7 @@
 seed: 1234
 
 dataset:
-  anno_path: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K_cleaned.json"   # 原始 json list
+  anno_path: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_val_200_GT.json"   # 原始 json list
   point_root: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/8192_npy"
   pointnum: 8192
   use_color: true
@@ -24,7 +24,7 @@ dataset:
   max_samples: -1
 
 runtime:
-  output_dir: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned_24"
+  output_dir: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_val_200"
   overwrite: false
 
   # dataloader

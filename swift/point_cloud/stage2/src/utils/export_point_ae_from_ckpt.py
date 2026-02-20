@@ -44,7 +44,7 @@ def extract_point_ae_state_dict(swift_ckpt_dir: str) -> Dict[str, torch.Tensor]:
 
     if len(ae_keys) == 0:
         # 给一点诊断输出
-        sample_keys = list(weight_map.keys())[:50]
+        sample_keys = list(weight_map.keys())
         raise RuntimeError(
             "No keys containing module name 'point_ae' found in checkpoint.\n"
             f"Example keys: {sample_keys}"

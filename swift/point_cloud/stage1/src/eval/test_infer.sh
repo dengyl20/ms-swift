@@ -10,4 +10,6 @@ export MIOPEN_CUSTOM_CACHE_DIR="${BASE}/miopen_cache"
 # export MIOPEN_DEBUG_DISABLE_SQL_WAL=1
 # export MIOPEN_DISABLE_CACHE=1
 
-GPUS_PER_RANK=2 torchrun --nproc_per_node=4 -m swift.point_cloud.stage1.src.eval.infer_modelnet40
+
+
+python -m swift.point_cloud.stage1.src.eval.infer_point_ae_qwen3_omni

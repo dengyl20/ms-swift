@@ -11,10 +11,10 @@ from torch.utils.data import Dataset
 # ============================================================
 # 全局配置（按需直接改这里；不使用 argparse）
 # ============================================================
-FEATURE_PT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/modelnet40_test_point_tokens.pt"
+FEATURE_PT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/modelnet40_gray_color.pt"
 
 # 是否只保留 valid==1 的样本（默认 False：小测试集一般不需要过滤；但你可打开）
-REQUIRE_VALID = False
+REQUIRE_VALID = True
 
 
 class ModelNet40PointTokenDataset(Dataset):

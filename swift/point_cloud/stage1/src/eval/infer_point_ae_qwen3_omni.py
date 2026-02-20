@@ -16,10 +16,15 @@ infer_point_ae_qwen3_omni.py
 4) 其它不需要改动的无关部分不改动
 
 【修改点（本轮）】
-- Baseline(no inject) 不再使用带有 <point> 的 prompt：会移除所有 <point> token（仅此 baseline）
-- 重新设计 prompt 组织格式（system + user）：
-  - 注入版本：使用明确的“3D_POINT_CLOUD_EMBEDDING / QUESTION / ANSWER”结构，便于模型理解注入段与问题段
-  - 非注入 baseline：只给 QUESTION / ANSWER（无任何 <point> token）
+1) 新增 AE_TEXT_MASK_MODE：
+   - "dataset"：使用 dataset 提供的 text_mask（变长）
+   - "fixed_prefix"：固定 mask 前 N 位为 True（定长），用于生成定长的 AE 重构 token embedding
+2) 移除 baseline：Baseline(no inject, prompt w/o <point>)
+3) 删除原本定量评测：Pred(inject AE embedding) vs GT(answer) 的 sentence embedding 相似度（全部移除）
+4) 新增定量评测（对 train/val 都有效）：
+   - Ground Truth text embedding vs AE 重构 text embedding 的相似度：cosine + MSE
+5) 将评测结果保存到指定路径文件（包含 baseline / pred / gt / embedding 指标）
+6) 同时评测训练集子集 + 验证集（两者均由 dataset_info.yaml + 对话 json 定义，格式相同）
 
 【注意】
 - system prompt 中避免出现字面字符串 "<point>"，否则会被 tokenizer 识别为 special token 并影响注入定位。
@@ -95,19 +100,28 @@ def _rule(title: str = "") -> None:
 # =========================
 
 # 你训练好的 AE checkpoint（best.pt 或某个 epoch_xxx.pt）
-AE_CKPT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints/v88-20260211-185421/point_ae_finetuned_checkpoint-1006.pt"
+AE_CKPT_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/checkpoints/v100-20260215-045054/point_ae_finetuned_checkpoint-1006.pt"
 
+# ===== Train split =====
 # stage1 提取 feature 的 dataset_info.yaml（里面记录 shards 路径、shape、dtype 等）
 FEATURE_DATASET_INFO_YAML = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned_24/dataset_info.yaml"
 
 # 你指定的原始对话 JSON（用于取 prompt 与 GT）
 CONV_JSON_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_660K_filtered.json"
 
+# ===== Val split（需你填入验证集对应路径；格式与训练集相同）=====
+# NOTE: 若你希望强制评测验证集，请确保这两个路径存在且可读
+RUN_EVAL_VALIDATION = True
+FEATURE_DATASET_INFO_YAML_VAL = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_val_200/dataset_info.yaml"  # e.g. "/path/to/val/dataset_info.yaml"
+CONV_JSON_PATH_VAL = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/PointLLM/PointLLM/PointLLM_brief_description_val_200_GT.json"             # e.g. "/path/to/val/conversations.json"
+
 # Qwen3-Omni 模型（用 Instruct 权重加载 Thinker text-only，省显存）
 QWEN_MODEL_NAME_OR_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
-# 只做定性：跑多少条
-NUM_SAMPLES = 32
+# 只做定性：训练集跑多少条
+NUM_SAMPLES = 100
+# 验证集跑多少条（可单独设置）
+NUM_SAMPLES_VAL = 100
 
 # 从 feature dataset 扫描样本的起点与最大扫描量（防止一直找不到对应 object_id）
 DATASET_SCAN_START = 0
@@ -118,6 +132,12 @@ SEED = 42
 
 # prompt 里的占位符文本
 POINT_PLACEHOLDER = "<point>"
+
+# ===== AE text mask 策略（新增）=====
+# "dataset": 使用 dataset 提供的 text_mask（变长，当前默认行为）
+# "fixed_prefix": 固定前 N 个 token 为 True（定长），用于生成定长重构 embedding
+AE_TEXT_MASK_MODE = "fixed_prefix"  # "dataset" | "fixed_prefix"
+AE_FIXED_PREFIX_LEN = 8       # 仅当 AE_TEXT_MASK_MODE="fixed_prefix" 生效
 
 # ===== 注入策略 =====
 # "sequence": 不压缩，取 mask=True 的所有 token embedding，逐 token 注入（推荐与你问题对应）
@@ -136,10 +156,7 @@ DO_SAMPLE = False
 TEMPERATURE = 0.7   # DO_SAMPLE=False 时 temperature 不生效
 TOP_P = 0.9         # DO_SAMPLE=False 时 top_p 不生效
 
-# 是否也跑一个 baseline（不注入 embedding）方便你对比
-RUN_BASELINE_NO_INJECT = True
-
-# ===== 新增 baseline：注入 Ground Truth text embedding =====
+# ===== baseline：注入 Ground Truth text embedding =====
 RUN_BASELINE_GT_TEXT_EMBED_INJECT = True
 
 # ===== 调试与输出（新增）=====
@@ -152,6 +169,13 @@ DEBUG_MAX_SHOW_SPANS = 20
 # 是否对注入向量做一个“最近邻 token proxy”（Top-K），帮助你直观看 embedding “像什么词”
 DEBUG_SHOW_TOPK_TOKEN_PROXIES = True
 DEBUG_TOPK_TOKENS = 6
+
+# ===== 新增：结果保存 =====
+# 结果将保存为 JSONL（每行一个样本记录），并额外保存一个 summary JSON
+EVAL_OUTPUT_DIR = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/point_cloud/stage1/src/eval/outputs/objaverse"
+EVAL_OUTPUT_JSONL = os.path.join(EVAL_OUTPUT_DIR, "infer_point_ae_qwen3_omni_eval.jsonl")
+EVAL_OUTPUT_SUMMARY_JSON = os.path.join(EVAL_OUTPUT_DIR, "infer_point_ae_qwen3_omni_eval_summary.json")
+EVAL_OUTPUT_OVERWRITE = True  # True: 覆盖；False: 追加
 
 # system prompt（重新设计：避免出现字面 "<point>"）
 SYSTEM_PROMPT = (
@@ -217,7 +241,7 @@ def expand_point_placeholders(user_text: str, k: int, placeholder: str = "<point
     return block + "\n" + user_text
 
 
-# ===== 新增：移除文本中所有 <point>（用于 no-inject baseline）=====
+# ===== 新增：移除文本中所有 <point>（用于抽取“纯问题”）=====
 def strip_all_point_placeholders(text: str, placeholder: str = "<point>") -> str:
     """
     删除 text 中所有 placeholder 字面串，并做轻量清洗：
@@ -233,7 +257,7 @@ def strip_all_point_placeholders(text: str, placeholder: str = "<point>") -> str
     return "\n".join(lines).strip()
 
 
-# ===== 新增：构造更清晰的 user prompt（注入 / 非注入）=====
+# ===== 新增：构造更清晰的 user prompt（注入）=====
 def build_user_prompt_with_points(question_text: str, k: int, placeholder: str = "<point>") -> str:
     k = max(1, int(k))
     q = str(question_text).strip()
@@ -243,17 +267,6 @@ def build_user_prompt_with_points(question_text: str, k: int, placeholder: str =
     return (
         "3D_POINT_CLOUD_EMBEDDING:\n"
         f"{point_block}\n\n"
-        "QUESTION:\n"
-        f"{q}\n\n"
-        "ANSWER:"
-    )
-
-
-def build_user_prompt_no_points(question_text: str) -> str:
-    q = str(question_text).strip()
-    if q == "":
-        q = "Describe the object represented by the 3D point cloud."
-    return (
         "QUESTION:\n"
         f"{q}\n\n"
         "ANSWER:"
@@ -423,11 +436,27 @@ def ae_point_to_text_token_embeddings(
     """
     返回：
       pred_text_tokens: (L,H)  = out["text_recon_from_point"][0]
-      mask:            (L,)    = text_mask（原样返回）
+      mask:            (L,)    = 根据 AE_TEXT_MASK_MODE 返回 dataset mask 或 fixed prefix mask
     """
     pt = to_device_dtype(point_tokens.unsqueeze(0), device, dtype)  # (1,G,D)
     te = to_device_dtype(text_embeds.unsqueeze(0), device, dtype)   # (1,L,H)
-    tm = text_mask.unsqueeze(0).to(device=device)                   # (1,L) bool
+
+    # ===== 新增：通过全局变量控制 mask 策略（dataset / fixed_prefix）=====
+    L = int(text_embeds.shape[0])
+
+    if AE_TEXT_MASK_MODE == "dataset":
+        tm = text_mask.unsqueeze(0).to(device=device)  # (1,L) bool
+        used_mask = text_mask.to(device=device)
+    elif AE_TEXT_MASK_MODE == "fixed_prefix":
+        fixed_len = int(AE_FIXED_PREFIX_LEN)
+        if fixed_len <= 0:
+            raise ValueError(f"AE_FIXED_PREFIX_LEN must be > 0 when AE_TEXT_MASK_MODE='fixed_prefix', got {fixed_len}")
+        fixed_mask = torch.zeros(L, dtype=torch.bool, device=device)
+        fixed_mask[: min(fixed_len, L)] = True
+        tm = fixed_mask.unsqueeze(0)  # (1,L)
+        used_mask = fixed_mask
+    else:
+        raise ValueError(f"Unknown AE_TEXT_MASK_MODE: {AE_TEXT_MASK_MODE}")
 
     out = ae(point_feat=pt, text_feat=te, text_mask=tm)
 
@@ -435,40 +464,7 @@ def ae_point_to_text_token_embeddings(
         raise RuntimeError("AE forward output missing key: 'text_recon_from_point'")
 
     pred = out["text_recon_from_point"][0]  # (L,H)
-    return pred, text_mask.to(device=device)
-
-
-# @torch.no_grad()
-# def ae_point_to_text_token_embeddings(
-#     ae: UnifiedPointTextAE,
-#     point_tokens: torch.Tensor,  # (G,D)
-#     text_embeds: torch.Tensor,   # (L,H)
-#     text_mask: torch.Tensor,     # (L,) 仍保留入参，但会被覆盖
-#     device: torch.device,
-#     dtype: torch.dtype,
-# ) -> Tuple[torch.Tensor, torch.Tensor]:
-#     """
-#     返回：
-#       pred_text_tokens: (L,H)  = out["text_recon_from_point"][0]
-#       mask:            (L,)    = 固定前16位为True的mask
-#     """
-#     pt = to_device_dtype(point_tokens.unsqueeze(0), device, dtype)  # (1,G,D)
-#     te = to_device_dtype(text_embeds.unsqueeze(0), device, dtype)   # (1,L,H)
-
-#     # ===== 关键修改：固定mask前16位为True =====
-#     L = text_embeds.shape[0]
-#     fixed_len = 16
-#     fixed_mask = torch.zeros(L, dtype=torch.bool, device=device)
-#     fixed_mask[: min(fixed_len, L)] = True
-#     tm = fixed_mask.unsqueeze(0)  # (1,L)
-
-#     out = ae(point_feat=pt, text_feat=te, text_mask=tm)
-
-#     if "text_recon_from_point" not in out:
-#         raise RuntimeError("AE forward output missing key: 'text_recon_from_point'")
-
-#     pred = out["text_recon_from_point"][0]  # (L,H)
-#     return pred, fixed_mask
+    return pred, used_mask
 
 
 @torch.no_grad()
@@ -752,6 +748,64 @@ def render_injection_debug(
 
 
 # =========================
+# 4.6) 新增：定量评测（Embedding 重构质量）
+# =========================
+
+@torch.no_grad()
+def embedding_recon_cos_mse(
+    *,
+    gt_text_tokens: torch.Tensor,    # (L,H)
+    pred_text_tokens: torch.Tensor,  # (L,H)
+    mask: torch.Tensor,              # (L,) bool
+    max_tokens: int,
+) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[str]]:
+    """
+    对 ground truth text embedding 与 AE 重构 embedding 做定量比较：
+    - cosine：对 (K,H) flatten 后做 cosine（更稳定）
+    - mse：对 (K,H) 做 mean MSE
+
+    K 由 mask 选出，并再 cap 到 max_tokens（与注入上限一致，便于关联分析）。
+    """
+    try:
+        if gt_text_tokens.dim() != 2 or pred_text_tokens.dim() != 2:
+            raise ValueError(f"gt/pred tokens must be 2D (L,H). got gt={tuple(gt_text_tokens.shape)} pred={tuple(pred_text_tokens.shape)}")
+        if mask.dim() != 1:
+            raise ValueError(f"mask must be 1D (L,). got {tuple(mask.shape)}")
+
+        L = int(gt_text_tokens.shape[0])
+        if int(pred_text_tokens.shape[0]) != L:
+            raise ValueError(f"L mismatch: gt L={L} pred L={int(pred_text_tokens.shape[0])}")
+
+        m = mask.to(device=gt_text_tokens.device)
+        idx = torch.where(m)[0]
+        if idx.numel() == 0:
+            idx = torch.arange(min(1, L), device=gt_text_tokens.device)
+
+        gt_sel = gt_text_tokens.index_select(0, idx)
+        pr_sel = pred_text_tokens.index_select(0, idx)
+
+        K = int(gt_sel.shape[0])
+        if max_tokens is not None and int(max_tokens) > 0 and K > int(max_tokens):
+            gt_sel = gt_sel[: int(max_tokens)]
+            pr_sel = pr_sel[: int(max_tokens)]
+            K = int(gt_sel.shape[0])
+
+        a = pr_sel.to(dtype=torch.float32)
+        b = gt_sel.to(dtype=torch.float32)
+
+        mse = float(F.mse_loss(a, b, reduction="mean").item())
+
+        af = a.reshape(-1)
+        bf = b.reshape(-1)
+        denom = (af.norm() * bf.norm()).clamp_min(1e-8)
+        cos = float((af * bf).sum().div(denom).item())
+
+        return cos, mse, K, None
+    except Exception as e:
+        return None, None, None, repr(e)
+
+
+# =========================
 # 5) 生成（优先 generate，失败则 fallback greedy）
 # =========================
 
@@ -932,92 +986,88 @@ def collect_samples_from_feature_dataset(
 
 
 # =========================
-# 7) main
+# 7) 结果保存工具
 # =========================
 
-def main() -> None:
-    set_global_seed(SEED)
-    torch.set_grad_enabled(False)
+def _ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d and (not os.path.exists(d)):
+        os.makedirs(d, exist_ok=True)
+
+
+def write_jsonl_line(f, obj: Dict[str, Any]) -> None:
+    s = json.dumps(obj, ensure_ascii=False)
+    f.write(s + "\n")
+    f.flush()
+
+
+# =========================
+# 8) split eval
+# =========================
+
+def run_eval_on_split(
+    *,
+    split_name: str,
+    feature_dataset_info_yaml: str,
+    conv_json_path: str,
+    num_samples: int,
+    model: Qwen3OmniMoeThinkerForConditionalGeneration,
+    processor: Qwen3OmniMoeProcessor,
+    tokenizer,
+    emb_layer: torch.nn.Module,
+    emb_device: torch.device,
+    emb_dtype: torch.dtype,
+    llm_hidden: int,
+    ae: UnifiedPointTextAE,
+    ae_cfg: Dict[str, Any],
+    emb_weight: torch.Tensor,
+    emb_weight_norm: Optional[torch.Tensor],
+    results_f,
+) -> Dict[str, Any]:
+    """
+    在指定 split 上评测并写入 JSONL。
+    返回 split summary（计数 + mean embedding metrics）。
+    """
+    if num_samples <= 0:
+        _p(f"[INFO] Skip split={split_name} because num_samples={num_samples}", style="yellow" if _console is not None else None)
+        return {"split": split_name, "num_requested": num_samples, "num_run": 0}
 
     # -------- 1) load feature dataset --------
-    feat_ds = ProcessedPointTextFeatureDataset(FEATURE_DATASET_INFO_YAML, require_valid=True)
+    feat_ds = ProcessedPointTextFeatureDataset(feature_dataset_info_yaml, require_valid=True)
 
     # 先多取一些候选 object_id，再去 JSON 里找对应对话（避免 JSON 全量 load）
     candidate = collect_samples_from_feature_dataset(
         feat_ds,
-        num_samples=max(NUM_SAMPLES * 5, NUM_SAMPLES),
+        num_samples=max(num_samples * 5, num_samples),
         start=DATASET_SCAN_START,
         max_scan=MAX_DATASET_SCAN,
     )
     if len(candidate) == 0:
-        raise RuntimeError("No valid samples found in feature dataset. Check dataset_info_yaml / require_valid.")
+        raise RuntimeError(f"No valid samples found in feature dataset for split={split_name}. Check dataset_info_yaml / require_valid.")
 
     cand_ids = [c["object_id"] for c in candidate]
-    conv_map = load_conversations_for_object_ids(CONV_JSON_PATH, cand_ids)
+    conv_map = load_conversations_for_object_ids(conv_json_path, cand_ids)
 
     # 过滤出 JSON 里确实有对话的样本
     samples = [c for c in candidate if c["object_id"] in conv_map]
-    samples = samples[:NUM_SAMPLES]
+
+    # # 更符合“随机选取”的语义：在 matched pool 内 shuffle 后取前 num_samples
+    # random.shuffle(samples)
+    samples = samples[:num_samples]
 
     if len(samples) == 0:
         raise RuntimeError(
-            "No samples matched between feature dataset and conversation JSON. "
+            f"No samples matched between feature dataset and conversation JSON for split={split_name}. "
             "Please check object_id consistency / scan range."
         )
 
+    _p(f"[INFO] ===== Split={split_name} =====", style="bold green" if _console is not None else None)
     _p(f"[INFO] Feature dataset total={len(feat_ds)}", style="green" if _console is not None else None)
     _p(f"[INFO] Candidate={len(candidate)} matched_in_json={len(samples)} (will run {len(samples)})", style="green" if _console is not None else None)
     _p(f"[INFO] POINT_INJECT_MODE={POINT_INJECT_MODE}, MAX_POINT_TOKENS={MAX_POINT_TOKENS}", style="green" if _console is not None else None)
+    _p(f"[INFO] AE_TEXT_MASK_MODE={AE_TEXT_MASK_MODE}, AE_FIXED_PREFIX_LEN={AE_FIXED_PREFIX_LEN}", style="green" if _console is not None else None)
 
-    # -------- 2) load Qwen3-Omni Thinker + processor --------
-    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
-        QWEN_MODEL_NAME_OR_PATH,
-        dtype="auto",
-        device_map="auto",
-    )
-    model.eval()
-    processor = Qwen3OmniMoeProcessor.from_pretrained(QWEN_MODEL_NAME_OR_PATH)
-    tokenizer = processor.tokenizer
-
-    # ===== 关键修改：把 <point> 加为 tokenizer 的单独 special token（1 token）=====
-    # - 必须在后续构造 input_ids 前完成
-    # - 若新增 token，需要 resize 模型词嵌入
-    old_point_ids = tokenizer.encode(POINT_PLACEHOLDER, add_special_tokens=False)
-    num_added = tokenizer.add_special_tokens(
-        {"additional_special_tokens": [AddedToken(POINT_PLACEHOLDER, lstrip=False, rstrip=False)]}
-    )
-    if num_added > 0:
-        model.resize_token_embeddings(len(tokenizer))
-        # 为了让“no-inject baseline”更稳定：用旧分词的平均 embedding 初始化新 token embedding
-        try:
-            point_id_new = int(tokenizer.convert_tokens_to_ids(POINT_PLACEHOLDER))
-            emb_tmp = model.get_input_embeddings()
-            if isinstance(old_point_ids, list) and len(old_point_ids) > 0:
-                ids_t = torch.tensor(old_point_ids, device=emb_tmp.weight.device, dtype=torch.long)
-                with torch.no_grad():
-                    init_vec = emb_tmp.weight.data.index_select(0, ids_t).mean(dim=0)
-                    emb_tmp.weight.data[point_id_new].copy_(init_vec)
-        except Exception:
-            pass
-
-    point_token_id = tokenizer.convert_tokens_to_ids(POINT_PLACEHOLDER)
-    _p(
-        f"[INFO] Registered '{POINT_PLACEHOLDER}' as a single special token: id={point_token_id}, added={num_added}, tokenizer_len={len(tokenizer)}",
-        style="green" if _console is not None else None,
-    )
-
-    # embedding device/dtype：用于注入向量对齐
-    emb_layer = model.get_input_embeddings()
-    emb_device = emb_layer.weight.device
-    emb_dtype = emb_layer.weight.dtype
-    llm_hidden = emb_layer.weight.shape[1]
-
-    _p(f"[INFO] Qwen embedding device={emb_device}, dtype={emb_dtype}, hidden={llm_hidden}", style="green" if _console is not None else None)
-
-    # -------- 3) load AE（放到同一个 device/dtype 更省拷贝）--------
-    ae, ae_cfg = load_ae_from_ckpt(AE_CKPT_PATH, device=emb_device, dtype=emb_dtype)
-
-    # sanity check：AE 输出维度应等于 LLM hidden
+    # -------- 2) sanity check：AE 输出维度应等于 LLM hidden --------
     ae_d_text_in = int(ae_cfg["model"]["d_text_in"])
     if ae_d_text_in != llm_hidden:
         _p(
@@ -1026,17 +1076,15 @@ def main() -> None:
             style="yellow" if _console is not None else None,
         )
 
-    # ---- 新增：为 token proxy（Top-K）准备 embedding norm（只在需要时计算一次）----
-    emb_weight = emb_layer.weight
-    emb_weight_norm = None
-    if DEBUG_SHOW_INJECTION_DEBUG and DEBUG_SHOW_TOPK_TOKEN_PROXIES:
-        try:
-            emb_weight_norm = emb_weight.norm(dim=1).clamp_min(1e-6)
-        except Exception:
-            emb_weight_norm = None
+    # -------- 3) run inference --------
+    emb_cos_sims: List[float] = []
+    emb_mses: List[float] = []
+    num_metric_ok = 0
+    num_total = 0
 
-    # -------- 4) run inference --------
     for si, sample in enumerate(samples):
+        num_total += 1
+
         obj_id = sample["object_id"]
         human_raw = conv_map[obj_id]["human"]
         gt = conv_map[obj_id]["gpt"]
@@ -1054,8 +1102,20 @@ def main() -> None:
             dtype=emb_dtype,
         )
 
-        # ===== 新增 baseline 1：准备 GT text embedding（来自 feature dataset）=====
+        # ===== baseline：准备 GT text embedding（来自 feature dataset）=====
         gt_text_tokens = to_device_dtype(sample["text_embeds"], emb_device, emb_dtype)  # (L,H)
+
+        # 4.1.5 新增：Embedding 重构质量指标（GT embedding vs AE recon embedding）
+        emb_cos_sim, emb_mse, emb_k_used, emb_metric_error = embedding_recon_cos_mse(
+            gt_text_tokens=gt_text_tokens,
+            pred_text_tokens=pred_tokens,
+            mask=mask,
+            max_tokens=MAX_POINT_TOKENS,
+        )
+        if isinstance(emb_cos_sim, float) and isinstance(emb_mse, float):
+            emb_cos_sims.append(emb_cos_sim)
+            emb_mses.append(emb_mse)
+            num_metric_ok += 1
 
         # 4.2 构造 point 注入向量（sequence or pooled）
         if POINT_INJECT_MODE == "sequence":
@@ -1078,9 +1138,6 @@ def main() -> None:
             # ===== 重新组织 prompt（注入版本）：明确分块 =====
             human = build_user_prompt_with_points(question_text, K, POINT_PLACEHOLDER)
 
-            # ===== no-inject baseline 使用无 <point> 的 prompt =====
-            human_no_inject = build_user_prompt_no_points(question_text)
-
             # 两个注入版本
             point_payload_ae = ae_seq  # (K,H)
             point_payload_gt = gt_seq  # (K,H)
@@ -1093,9 +1150,6 @@ def main() -> None:
             # ===== 重新组织 prompt（注入版本）：明确分块 =====
             human = build_user_prompt_with_points(question_text, K, POINT_PLACEHOLDER)
 
-            # ===== no-inject baseline 使用无 <point> 的 prompt =====
-            human_no_inject = build_user_prompt_no_points(question_text)
-
             point_payload_ae = point_vec_ae
             point_payload_gt = point_vec_gt
         else:
@@ -1106,40 +1160,11 @@ def main() -> None:
         inputs = {k: v.to(emb_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         input_ids = inputs["input_ids"]  # (1,S)
 
-        # ===== baseline (no inject) —— 使用“无 <point>”的 prompt =====
-        baseline_text = None
-        baseline_human_used = None
-        if RUN_BASELINE_NO_INJECT:
-            try:
-                baseline_human_used = human_no_inject
-                inputs_no_inject = build_qwen_inputs(processor, human_no_inject)
-                inputs_no_inject = {k: v.to(emb_device) if isinstance(v, torch.Tensor) else v for k, v in inputs_no_inject.items()}
-                input_ids_no_inject = inputs_no_inject["input_ids"]
-
-                gen_kwargs = dict(
-                    **inputs_no_inject,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    do_sample=DO_SAMPLE,
-                )
-                if DO_SAMPLE:
-                    gen_kwargs["temperature"] = TEMPERATURE
-                    gen_kwargs["top_p"] = TOP_P
-
-                base_out = model.generate(**gen_kwargs)
-                prompt_len = input_ids_no_inject.shape[1]
-                baseline_text = tokenizer.decode(
-                    base_out[0, prompt_len:],
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                ).strip()
-            except Exception as e:
-                baseline_text = f"[baseline generation failed: {repr(e)}]"
-
         # 4.4 compute embeds & inject（base embeds for inject prompt）
         with torch.no_grad():
             base_embeds = emb_layer(input_ids)  # (1,S,H)
 
-        # ===== baseline 1：注入 GT text embedding =====
+        # ===== baseline：注入 GT text embedding =====
         gt_inject_text = None
         gt_injected_embeds = None
         gt_spans: List[Tuple[int, int]] = []
@@ -1172,6 +1197,7 @@ def main() -> None:
         spans: List[Tuple[int, int]] = []
         patterns: List[Tuple[str, List[int]]] = []
 
+        inject_error = None
         try:
             injected_embeds, spans, patterns = inject_point_embeddings_into_inputs_embeds(
                 tokenizer=tokenizer,
@@ -1181,21 +1207,47 @@ def main() -> None:
                 point_placeholder=POINT_PLACEHOLDER,
             )
         except Exception as e:
+            inject_error = repr(e)
+
+        if inject_error is not None:
             _rule()
-            _p(f"[{si}] object_id={obj_id}", style="bold red" if _console is not None else None)
-            _p("[ERROR] injection failed: " + repr(e), style="bold red" if _console is not None else None)
+            _p(f"[{split_name}][{si}] object_id={obj_id}", style="bold red" if _console is not None else None)
+            _p("[ERROR] injection failed: " + inject_error, style="bold red" if _console is not None else None)
             _p("Human(raw):")
             _p(human_raw)
-            _p("Human(used for inject):")
+            _p("Human(used for inject variants):")
             _p(human)
-            if RUN_BASELINE_NO_INJECT:
-                _p("Human(used for no-inject baseline):")
-                _p(human_no_inject)
             _p("GT:")
             _p(gt)
+
+            # 写入结果（失败也记录）
+            rec = {
+                "split": split_name,
+                "object_id": obj_id,
+                "global_index": sample.get("global_index", None),
+                "question": question_text,
+                "baseline_inject_gt_text_embeds": gt_inject_text,
+                "pred_inject_ae_embedding": None,
+                "gt_answer": gt,
+                "emb_cos_sim_gt_vs_ae": emb_cos_sim,
+                "emb_mse_gt_vs_ae": emb_mse,
+                "emb_k_used": emb_k_used,
+                "emb_metric_error": emb_metric_error,
+                "status": "inject_failed",
+                "error": inject_error,
+                "meta": {
+                    "POINT_INJECT_MODE": POINT_INJECT_MODE,
+                    "MAX_POINT_TOKENS": int(MAX_POINT_TOKENS),
+                    "K_injected": int(K),
+                    "AE_TEXT_MASK_MODE": AE_TEXT_MASK_MODE,
+                    "AE_FIXED_PREFIX_LEN": int(AE_FIXED_PREFIX_LEN),
+                },
+            }
+            write_jsonl_line(results_f, rec)
             continue
 
         # 4.5 generate with injected embeds
+        gen_error = None
         try:
             pred_text = generate_with_inputs_embeds(
                 model=model,
@@ -1207,8 +1259,8 @@ def main() -> None:
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
             )
-
         except Exception as e:
+            gen_error = repr(e)
             # fallback
             try:
                 pred_text = greedy_fallback_generate(
@@ -1218,31 +1270,39 @@ def main() -> None:
                     inputs_embeds=injected_embeds,
                     max_new_tokens=MAX_NEW_TOKENS,
                 )
-                pred_text = pred_text + f"  [fallback_used_due_to_generate_error={repr(e)}]"
+                pred_text = pred_text + f"  [fallback_used_due_to_generate_error={gen_error}]"
+                gen_error = None
             except Exception as e2:
                 pred_text = f"[inject generation failed: {repr(e)}; fallback also failed: {repr(e2)}]"
 
         # 4.6 pretty print result（rich）
-        _rule(f"[bold cyan]Sample {si}[/bold cyan]  object_id={obj_id}" if _console is not None else f"Sample {si} object_id={obj_id}")
+        _rule(f"[bold cyan]{split_name} Sample {si}[/bold cyan]  object_id={obj_id}" if _console is not None else f"{split_name} Sample {si} object_id={obj_id}")
 
         # meta info
         if _console is not None:
             meta = Table(title="Meta", box=box.SIMPLE, show_header=False)
+            meta.add_row("split", str(split_name))
             meta.add_row("object_id", str(obj_id))
             meta.add_row("global_index", str(sample.get("global_index", "N/A")))
             meta.add_row("POINT_INJECT_MODE", str(POINT_INJECT_MODE))
+            meta.add_row("AE_TEXT_MASK_MODE", str(AE_TEXT_MASK_MODE))
+            if AE_TEXT_MASK_MODE == "fixed_prefix":
+                meta.add_row("AE_FIXED_PREFIX_LEN", str(AE_FIXED_PREFIX_LEN))
             if POINT_INJECT_MODE == "sequence":
                 meta.add_row("K(injected)", f"{K} (capped by MAX_POINT_TOKENS={MAX_POINT_TOKENS})")
             else:
                 meta.add_row("pooled_mode", str(POINT_POOLING))
-            meta.add_row("RUN_BASELINE_NO_INJECT", str(RUN_BASELINE_NO_INJECT))
             meta.add_row("RUN_BASELINE_GT_TEXT_EMBED_INJECT", str(RUN_BASELINE_GT_TEXT_EMBED_INJECT))
+            meta.add_row("EmbCos(GT,AE)", f"{emb_cos_sim:.6f}" if isinstance(emb_cos_sim, float) else "N/A")
+            meta.add_row("EmbMSE(GT,AE)", f"{emb_mse:.6e}" if isinstance(emb_mse, float) else "N/A")
+            meta.add_row("EmbKUsed", str(emb_k_used) if emb_k_used is not None else "N/A")
             _console.print(meta)
         else:
             if POINT_INJECT_MODE == "sequence":
                 _p(f"[INFO] injected K={K} point tokens (capped by MAX_POINT_TOKENS={MAX_POINT_TOKENS})")
             else:
                 _p(f"[INFO] pooled injection mode={POINT_POOLING}")
+            _p(f"[INFO] EmbCos(GT,AE)={emb_cos_sim}  EmbMSE(GT,AE)={emb_mse}  EmbKUsed={emb_k_used}")
 
         # debug: spans/patterns
         if DEBUG_SHOW_INJECTION_DEBUG:
@@ -1276,14 +1336,9 @@ def main() -> None:
         # prompts
         if _console is not None:
             _console.print(Panel(human, title="Human(prompt used for inject variants)", border_style="cyan", expand=False))
-            if RUN_BASELINE_NO_INJECT and baseline_human_used is not None:
-                _console.print(Panel(baseline_human_used, title="Human(prompt used for no-inject baseline)", border_style="magenta", expand=False))
         else:
             _p("Human(prompt used for inject variants):")
             _p(human)
-            if RUN_BASELINE_NO_INJECT and baseline_human_used is not None:
-                _p("Human(prompt used for no-inject baseline):")
-                _p(baseline_human_used)
 
         # outputs
         if _console is not None:
@@ -1291,21 +1346,16 @@ def main() -> None:
             out_tb.add_column("Variant", style="bold", justify="left")
             out_tb.add_column("Text", overflow="fold", justify="left")
 
-            if RUN_BASELINE_NO_INJECT:
-                out_tb.add_row("Baseline(no inject, prompt w/o <point>)", baseline_text if baseline_text is not None else "")
             if RUN_BASELINE_GT_TEXT_EMBED_INJECT:
                 out_tb.add_row("Baseline(inject GT text_embeds)", gt_inject_text if gt_inject_text is not None else "")
 
             out_tb.add_row("Pred(inject AE embedding)", pred_text if pred_text is not None else "")
             out_tb.add_row("GT(answer)", gt)
-
+            out_tb.add_row("EmbCos(GT,AE)", f"{emb_cos_sim:.6f}" if isinstance(emb_cos_sim, float) else f"N/A ({emb_metric_error})" if emb_metric_error else "N/A")
+            out_tb.add_row("EmbMSE(GT,AE)", f"{emb_mse:.6e}" if isinstance(emb_mse, float) else f"N/A ({emb_metric_error})" if emb_metric_error else "N/A")
             _console.print(out_tb)
         else:
             _p("-" * 80)
-            if RUN_BASELINE_NO_INJECT:
-                _p("Baseline(no inject, prompt w/o <point>):")
-                _p(baseline_text)
-                _p("-" * 80)
             if RUN_BASELINE_GT_TEXT_EMBED_INJECT:
                 _p("Baseline(inject GT text_embeds):")
                 _p(gt_inject_text)
@@ -1315,8 +1365,216 @@ def main() -> None:
             _p("-" * 80)
             _p("GT(answer):")
             _p(gt)
+            _p("-" * 80)
+            _p(f"EmbCos(GT,AE): {emb_cos_sim}  EmbMSE(GT,AE): {emb_mse}  EmbKUsed={emb_k_used}  (err={emb_metric_error})")
 
-    _p("\n[INFO] Done.", style="green" if _console is not None else None)
+        # 写入 JSONL 结果
+        rec = {
+            "split": split_name,
+            "object_id": obj_id,
+            "global_index": sample.get("global_index", None),
+            "question": question_text,
+            "baseline_inject_gt_text_embeds": gt_inject_text,
+            "pred_inject_ae_embedding": pred_text,
+            "gt_answer": gt,
+            "emb_cos_sim_gt_vs_ae": emb_cos_sim,
+            "emb_mse_gt_vs_ae": emb_mse,
+            "emb_k_used": emb_k_used,
+            "emb_metric_error": emb_metric_error,
+            "status": "ok" if gen_error is None else "gen_error_fallback_or_failed",
+            "error": gen_error,
+            "meta": {
+                "POINT_INJECT_MODE": POINT_INJECT_MODE,
+                "MAX_POINT_TOKENS": int(MAX_POINT_TOKENS),
+                "K_injected": int(K),
+                "AE_TEXT_MASK_MODE": AE_TEXT_MASK_MODE,
+                "AE_FIXED_PREFIX_LEN": int(AE_FIXED_PREFIX_LEN),
+                "DO_SAMPLE": bool(DO_SAMPLE),
+                "MAX_NEW_TOKENS": int(MAX_NEW_TOKENS),
+            },
+        }
+        write_jsonl_line(results_f, rec)
+
+    # split summary
+    mean_cos = float(np.mean(emb_cos_sims)) if len(emb_cos_sims) > 0 else None
+    mean_mse = float(np.mean(emb_mses)) if len(emb_mses) > 0 else None
+    summary = {
+        "split": split_name,
+        "num_requested": int(num_samples),
+        "num_run": int(num_total),
+        "num_emb_metric_ok": int(num_metric_ok),
+        "mean_emb_cos_sim_gt_vs_ae": mean_cos,
+        "mean_emb_mse_gt_vs_ae": mean_mse,
+    }
+    _p(f"[INFO] Split={split_name} done. num_run={num_total}, mean_emb_cos={mean_cos}, mean_emb_mse={mean_mse}", style="green" if _console is not None else None)
+    return summary
+
+
+# =========================
+# 9) main
+# =========================
+
+def main() -> None:
+    set_global_seed(SEED)
+    torch.set_grad_enabled(False)
+
+    # -------- 0) output files --------
+    _ensure_parent_dir(EVAL_OUTPUT_JSONL)
+    _ensure_parent_dir(EVAL_OUTPUT_SUMMARY_JSON)
+    mode = "w" if EVAL_OUTPUT_OVERWRITE else "a"
+    results_f = open(EVAL_OUTPUT_JSONL, mode, encoding="utf-8")
+
+    # -------- 1) load Qwen3-Omni Thinker + processor --------
+    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+        QWEN_MODEL_NAME_OR_PATH,
+        dtype="auto",
+        device_map="auto",
+    )
+    model.eval()
+    processor = Qwen3OmniMoeProcessor.from_pretrained(QWEN_MODEL_NAME_OR_PATH)
+    tokenizer = processor.tokenizer
+
+    # ===== 关键修改：把 <point> 加为 tokenizer 的单独 special token（1 token）=====
+    # - 必须在后续构造 input_ids 前完成
+    # - 若新增 token，需要 resize 模型词嵌入
+    old_point_ids = tokenizer.encode(POINT_PLACEHOLDER, add_special_tokens=False)
+    num_added = tokenizer.add_special_tokens(
+        {"additional_special_tokens": [AddedToken(POINT_PLACEHOLDER, lstrip=False, rstrip=False)]}
+    )
+    if num_added > 0:
+        model.resize_token_embeddings(len(tokenizer))
+        # 为了让“baseline 更稳定”：用旧分词的平均 embedding 初始化新 token embedding
+        try:
+            point_id_new = int(tokenizer.convert_tokens_to_ids(POINT_PLACEHOLDER))
+            emb_tmp = model.get_input_embeddings()
+            if isinstance(old_point_ids, list) and len(old_point_ids) > 0:
+                ids_t = torch.tensor(old_point_ids, device=emb_tmp.weight.device, dtype=torch.long)
+                with torch.no_grad():
+                    init_vec = emb_tmp.weight.data.index_select(0, ids_t).mean(dim=0)
+                    emb_tmp.weight.data[point_id_new].copy_(init_vec)
+        except Exception:
+            pass
+
+    point_token_id = tokenizer.convert_tokens_to_ids(POINT_PLACEHOLDER)
+    _p(
+        f"[INFO] Registered '{POINT_PLACEHOLDER}' as a single special token: id={point_token_id}, added={num_added}, tokenizer_len={len(tokenizer)}",
+        style="green" if _console is not None else None,
+    )
+
+    # embedding device/dtype：用于注入向量对齐
+    emb_layer = model.get_input_embeddings()
+    emb_device = emb_layer.weight.device
+    emb_dtype = emb_layer.weight.dtype
+    llm_hidden = emb_layer.weight.shape[1]
+
+    _p(f"[INFO] Qwen embedding device={emb_device}, dtype={emb_dtype}, hidden={llm_hidden}", style="green" if _console is not None else None)
+
+    # -------- 2) load AE（放到同一个 device/dtype 更省拷贝）--------
+    ae, ae_cfg = load_ae_from_ckpt(AE_CKPT_PATH, device=emb_device, dtype=emb_dtype)
+
+    # ---- 新增：为 token proxy（Top-K）准备 embedding norm（只在需要时计算一次）----
+    emb_weight = emb_layer.weight
+    emb_weight_norm = None
+    if DEBUG_SHOW_INJECTION_DEBUG and DEBUG_SHOW_TOPK_TOKEN_PROXIES:
+        try:
+            emb_weight_norm = emb_weight.norm(dim=1).clamp_min(1e-6)
+        except Exception:
+            emb_weight_norm = None
+
+    # -------- 3) eval train + val --------
+    summaries: List[Dict[str, Any]] = []
+
+    # Train
+    summaries.append(
+        run_eval_on_split(
+            split_name="train",
+            feature_dataset_info_yaml=FEATURE_DATASET_INFO_YAML,
+            conv_json_path=CONV_JSON_PATH,
+            num_samples=NUM_SAMPLES,
+            model=model,
+            processor=processor,
+            tokenizer=tokenizer,
+            emb_layer=emb_layer,
+            emb_device=emb_device,
+            emb_dtype=emb_dtype,
+            llm_hidden=llm_hidden,
+            ae=ae,
+            ae_cfg=ae_cfg,
+            emb_weight=emb_weight,
+            emb_weight_norm=emb_weight_norm,
+            results_f=results_f,
+        )
+    )
+
+    # Val
+    if RUN_EVAL_VALIDATION:
+        if (not isinstance(FEATURE_DATASET_INFO_YAML_VAL, str)) or (FEATURE_DATASET_INFO_YAML_VAL.strip() == ""):
+            raise RuntimeError("RUN_EVAL_VALIDATION=True but FEATURE_DATASET_INFO_YAML_VAL is empty. Please set it.")
+        if (not isinstance(CONV_JSON_PATH_VAL, str)) or (CONV_JSON_PATH_VAL.strip() == ""):
+            raise RuntimeError("RUN_EVAL_VALIDATION=True but CONV_JSON_PATH_VAL is empty. Please set it.")
+
+        summaries.append(
+            run_eval_on_split(
+                split_name="val",
+                feature_dataset_info_yaml=FEATURE_DATASET_INFO_YAML_VAL,
+                conv_json_path=CONV_JSON_PATH_VAL,
+                num_samples=NUM_SAMPLES_VAL,
+                model=model,
+                processor=processor,
+                tokenizer=tokenizer,
+                emb_layer=emb_layer,
+                emb_device=emb_device,
+                emb_dtype=emb_dtype,
+                llm_hidden=llm_hidden,
+                ae=ae,
+                ae_cfg=ae_cfg,
+                emb_weight=emb_weight,
+                emb_weight_norm=emb_weight_norm,
+                results_f=results_f,
+            )
+        )
+
+    results_f.close()
+
+    # -------- 4) save summary --------
+    summary_obj = {
+        "config": {
+            "AE_CKPT_PATH": AE_CKPT_PATH,
+            "QWEN_MODEL_NAME_OR_PATH": QWEN_MODEL_NAME_OR_PATH,
+            "FEATURE_DATASET_INFO_YAML": FEATURE_DATASET_INFO_YAML,
+            "CONV_JSON_PATH": CONV_JSON_PATH,
+            "FEATURE_DATASET_INFO_YAML_VAL": FEATURE_DATASET_INFO_YAML_VAL,
+            "CONV_JSON_PATH_VAL": CONV_JSON_PATH_VAL,
+            "RUN_EVAL_VALIDATION": bool(RUN_EVAL_VALIDATION),
+            "NUM_SAMPLES_TRAIN": int(NUM_SAMPLES),
+            "NUM_SAMPLES_VAL": int(NUM_SAMPLES_VAL),
+            "DATASET_SCAN_START": int(DATASET_SCAN_START),
+            "MAX_DATASET_SCAN": int(MAX_DATASET_SCAN),
+            "SEED": int(SEED),
+            "POINT_PLACEHOLDER": POINT_PLACEHOLDER,
+            "AE_TEXT_MASK_MODE": AE_TEXT_MASK_MODE,
+            "AE_FIXED_PREFIX_LEN": int(AE_FIXED_PREFIX_LEN),
+            "POINT_INJECT_MODE": POINT_INJECT_MODE,
+            "MAX_POINT_TOKENS": int(MAX_POINT_TOKENS),
+            "POINT_POOLING": POINT_POOLING,
+            "MAX_NEW_TOKENS": int(MAX_NEW_TOKENS),
+            "DO_SAMPLE": bool(DO_SAMPLE),
+            "TEMPERATURE": float(TEMPERATURE),
+            "TOP_P": float(TOP_P),
+            "RUN_BASELINE_GT_TEXT_EMBED_INJECT": bool(RUN_BASELINE_GT_TEXT_EMBED_INJECT),
+        },
+        "splits": summaries,
+        "outputs": {
+            "jsonl": os.path.abspath(EVAL_OUTPUT_JSONL),
+            "summary_json": os.path.abspath(EVAL_OUTPUT_SUMMARY_JSON),
+        },
+    }
+
+    with open(EVAL_OUTPUT_SUMMARY_JSON, "w", encoding="utf-8") as f:
+        json.dump(summary_obj, f, ensure_ascii=False, indent=2)
+
+    _p(f"\n[INFO] Done. Results saved to:\n- {os.path.abspath(EVAL_OUTPUT_JSONL)}\n- {os.path.abspath(EVAL_OUTPUT_SUMMARY_JSON)}",
+       style="green" if _console is not None else None)
 
 
 if __name__ == "__main__":

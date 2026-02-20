@@ -1,4 +1,4 @@
-dataset_info_yaml: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features/dataset_info.yaml"
+dataset_info_yaml: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/data_features_cleaned_24/dataset_info.yaml"
 require_valid: true
 
 print:
