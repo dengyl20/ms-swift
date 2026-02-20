@@ -1,0 +1,74 @@
+seed: 1234
+
+dataset:
+  meta_paths:
+    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/ssvtp/finetune.json'
+    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/hct/data1/finetune.json'
+    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/hct/data2/finetune.json'
+    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/hct/data3/finetune.json'
+
+  # 不同 TVL 子数据集字段可能不同，按优先级匹配
+  touch_key_candidates: ['tactile']
+  image_key_candidates: ['image']
+  text_key_candidates: ['text', 'caption', 'description']
+  id_key_candidates: ['id']
+
+  # JSON 若为相对路径，按以下 roots + meta 所在目录解析
+  touch_roots:
+    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset'
+  image_roots:
+    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset'
+
+  gpt_text_strategy: 'first'
+  require_all_modalities: true
+  verify_files: true
+  on_error: 'zero'   # zero | raise
+  max_samples: -1
+
+runtime:
+  output_dir: '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/tvl_features_stage1'
+  overwrite: False
+
+  batch_size: 8
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+
+  save_dtype: 'fp16'
+  flush_every: 50
+  log_every: 20
+
+encoders:
+  touch:
+    repo_path: '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/TVL/tvl'
+    tactile_model: 'vit_base_patch16_224'
+    checkpoint_path: '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/checkpoints/tvl_enc_vitb.pth'   # 你本地下载后的路径
+    tac_transform: 'TAC_PREPROCESS'                  # TVL repo里的预处理名
+    out_dim: 768
+    l2_normalize: true
+    input_dtype: 'fp32'
+
+
+  image:
+    # 与 stage1 一致：冻结图像 backbone 抽 token
+    model_name_or_path: 'openai/clip-vit-large-patch14'
+    trust_remote_code: true
+
+  text:
+    # 与 point_cloud/stage1/extract_features.py 一致：Qwen tokenizer + embedding table
+    model_name_or_path: 'Qwen/Qwen3-Omni-30B-A3B-Instruct'
+    tokenizer_name_or_path: 'Qwen/Qwen3-Omni-30B-A3B-Instruct'
+    trust_remote_code: true
+
+    torch_dtype: 'fp16'  # fp16 | bf16 | fp32
+    extract_embedding_and_discard_model: true
+    # embedding_weight_cache: '/path/to/qwen_embedding_weight.pt'
+
+    max_text_len: 24
+    add_special_tokens: false
+
+distributed:
+  num_gpus: 8
+  backend: 'nccl'
+
