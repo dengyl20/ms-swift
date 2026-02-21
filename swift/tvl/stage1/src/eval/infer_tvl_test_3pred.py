@@ -779,7 +779,7 @@ def run_one_dataset(
             num_ok_any += 1
         if any(s == "error" for s in [row["status_textemb"], row["status_touch_plain"], row["status_touch_vocab"]]):
             num_err_any += 1
-
+        print(f"[{name}] sample_id={sid} valid={valid} gt='{gt}' pred_textemb_plain='{row['pred_textemb_plain']}' pred_touch_plain='{row['pred_touch_plain']}' pred_touch_vocab='{row['pred_touch_vocab']}' status_textemb={row['status_textemb']} status_touch_plain={row['status_touch_plain']} status_touch_vocab={row['status_touch_vocab']}")
         rows.append(row)
 
     # save

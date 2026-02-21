@@ -2,12 +2,18 @@
 """
 infer_tvl_preprocess.py
 
-【功能】
-- 把 TVL 测试集的 SSVTP + HCT(data1/2/3) 分别组织成 meta json
-- 分别抽取 tactile/touch tokens，并保存成 memmap + dataset_info.yaml
-- 输出格式兼容 swift.tvl.stage1.src.data.feature_dataset.ProcessedTouchTextFeatureDataset
+【修复点（你提的关键问题）】
+- 原脚本为了避免泄漏，把 text_embeds 全部置 0。
+- 现在提供可选 text embedding 生成方式：
+  - zero: 保持原行为（text_embeds=0）
+  - qwen_input_embed: ✅用 Qwen 的输入 embedding 矩阵(embed_tokens.weight)把 caption token ids 映射为 text_embeds
 
-【输出目录结构（重点：两份 yaml 分开存）】
+【额外增强】
+- 若 dataset_info.yaml 已存在且 overwrite=False：
+  - 会检测 text_embeds 是否“看起来全 0”
+  - 若是，则只重写 text_embeds/text_mask（不重算 tactile tokens），从而直接修复历史输出
+
+【输出目录结构（两份 yaml 分开存）】
 OUT_DIR/
   ssvtp/
     meta_test.json
@@ -31,7 +37,7 @@ OUT_DIR/
 (1) 直接改文件开头 DEFAULT_* 配置，然后：
     CUDA_VISIBLE_DEVICES=0 python infer_tvl_preprocess.py
 
-(2) 或命令行覆盖（推荐你现在的方式）：
+(2) 或命令行覆盖：
     CUDA_VISIBLE_DEVICES=0 python infer_tvl_preprocess.py \
       --out_dir /vast/.../tvl_test_features_all \
       --include_ssvtp --include_hct --overwrite
@@ -46,15 +52,17 @@ import json
 import time
 import argparse
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 
 from transformers import AutoTokenizer
+from transformers.utils.hub import cached_file
 
-# --------- torch safe globals (你需要的) ---------
+# --------- torch safe globals ---------
 from torch.serialization import add_safe_globals
 add_safe_globals([argparse.Namespace])
 
@@ -93,21 +101,30 @@ DEFAULT_TVL_REPO_PATH = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Mult
 DEFAULT_TACTILE_ENCODER_CKPT = "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/checkpoints/tvl_enc_vitb.pth"
 DEFAULT_TACTILE_MODEL = "vit_base_patch16_224"
 
+# tokenizer 用于得到 input_ids/text_mask
 DEFAULT_QWEN_TOKENIZER = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+# ✅ 新增：用哪个 Qwen 模型权重来取 embed_tokens.weight（一般和 tokenizer 一样）
+DEFAULT_QWEN_MODEL_FOR_TEXT_EMBEDS = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 DEFAULT_SEED = 42
 DEFAULT_BATCH_SIZE = 16
 
+# text embedding 写入方式
+# - zero: 和你原脚本一致（全 0）
+# - qwen_input_embed: ✅用 Qwen embed_tokens.weight 生成 text_embeds
+DEFAULT_TEXT_EMBEDS_MODE = "qwen_input_embed"   # zero | qwen_input_embed
+DEFAULT_TEXT_BATCH_SIZE = 128                   # 文本 embedding 写入 batch
+
 # 是否做背景相减（HCT 有背景图；SSVTP 没有）
-# "none" 或 "background"
-DEFAULT_SUBTRACT_BACKGROUND = "none"
+DEFAULT_SUBTRACT_BACKGROUND = "none"  # none | background
 
 # prompt 生成策略（只写 meta json 用，不影响抽特征）
 DEFAULT_SSVTP_PROMPT_MODE = "random_prefix"  # random_prefix | fixed
 DEFAULT_HCT_PROMPT_MODE = "fixed"           # fixed | random_prefix
 DEFAULT_FIXED_PROMPT = "This image gives tactile feelings of?"
 
-# 你训练 features 的 spec
+# feature spec（和你训练 features 对齐）
 TOUCH_NUM_TOKENS = 197
 TOUCH_HIDDEN = 768
 TEXT_MAX_LEN = 24
@@ -150,7 +167,6 @@ def make_question_from_prefix(prefix: str) -> str:
 
 
 def normalize_id_from_ssvtp_rgb_rel(rgb_rel: str) -> str:
-    # images_rgb/image_437_rgb.jpg -> 000000000437
     base = os.path.basename(rgb_rel)
     m = re.search(r"image_(\d+)_rgb", base)
     if m:
@@ -159,7 +175,6 @@ def normalize_id_from_ssvtp_rgb_rel(rgb_rel: str) -> str:
 
 
 def ssvtp_rgb_rel_to_tactile_rel(rgb_rel: str) -> str:
-    # images_rgb/image_106_rgb.jpg -> images_tac/image_106_tac.jpg
     p = rgb_rel.strip().lstrip("/")
     p = p.replace("images_rgb/", "images_tac/")
     p = p.replace("_rgb.", "_tac.")
@@ -182,6 +197,189 @@ def short_sample_id(s: str) -> str:
     if len(b) <= 64:
         return s
     return b[:64].decode("utf-8", errors="ignore")
+
+
+# =========================================================
+# Qwen embed_tokens.weight loader (只加载 embedding 权重，不加载整个 30B)
+# =========================================================
+def _resolve_local_or_cached(model_name_or_path: str, filename: str) -> Optional[str]:
+    """
+    支持：
+    - model_name_or_path 是本地目录
+    - model_name_or_path 是 HF repo id（offline/local cache）
+    """
+    if os.path.isdir(model_name_or_path):
+        p = os.path.join(model_name_or_path, filename)
+        return p if os.path.exists(p) else None
+    try:
+        p = cached_file(model_name_or_path, filename, local_files_only=True)
+        return p if p and os.path.exists(p) else None
+    except Exception:
+        return None
+
+
+def load_qwen_input_embed_weight(
+    model_name_or_path: str,
+    prefer_suffix: str = "embed_tokens.weight",
+) -> Tuple[torch.Tensor, str]:
+    """
+    返回：(weight, tensor_key)
+    weight: (vocab_size, hidden)
+    逻辑：
+    1) 优先走 sharded safetensors index.json，定位 embed_tokens.weight 所在 shard，用 safetensors.safe_open 只取那一个 tensor。
+    2) 若找不到 index，报错并给出提示（避免不小心加载全模型）。
+    """
+    index_candidates = [
+        "model.safetensors.index.json",
+        "pytorch_model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+    ]
+
+    index_path = None
+    for fn in index_candidates:
+        index_path = _resolve_local_or_cached(model_name_or_path, fn)
+        if index_path:
+            break
+
+    if not index_path:
+        raise FileNotFoundError(
+            f"Cannot find safetensors index json in local cache for {model_name_or_path}. "
+            f"Tried: {index_candidates}. "
+            f"建议：先确保模型已下载到本机缓存；或传入本地模型目录。"
+        )
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        idx = json.load(f)
+    weight_map: Dict[str, str] = idx.get("weight_map", {}) or {}
+
+    if not weight_map:
+        raise RuntimeError(f"Index json has empty weight_map: {index_path}")
+
+    # 找 embed_tokens.weight 的 key
+    keys = [k for k in weight_map.keys() if k.endswith(prefer_suffix)]
+    if not keys:
+        keys = [k for k in weight_map.keys() if prefer_suffix in k]
+
+    if not keys:
+        sample_keys = list(weight_map.keys())[:30]
+        raise RuntimeError(
+            f"Cannot find any tensor key containing '{prefer_suffix}' in index.\n"
+            f"index={index_path}\n"
+            f"sample keys: {sample_keys}"
+        )
+
+    def _score(k: str) -> Tuple[int, int, int]:
+        # 更偏好 model.embed_tokens.weight
+        return (
+            0 if k.endswith(prefer_suffix) else 1,
+            0 if "model.embed_tokens" in k else 1,
+            len(k),
+        )
+
+    tensor_key = sorted(keys, key=_score)[0]
+    shard_filename = weight_map[tensor_key]
+
+    shard_path = _resolve_local_or_cached(model_name_or_path, shard_filename)
+    if not shard_path:
+        # 如果 index 在某个目录里（本地目录模式），shard_filename 也在同目录
+        if os.path.isfile(index_path):
+            cand = os.path.join(os.path.dirname(index_path), shard_filename)
+            shard_path = cand if os.path.exists(cand) else None
+    if not shard_path:
+        raise FileNotFoundError(f"Cannot resolve shard file '{shard_filename}' for tensor '{tensor_key}' (index={index_path})")
+
+    try:
+        from safetensors import safe_open  # type: ignore
+    except Exception as e:
+        raise ImportError("safetensors is required to load embedding weight without loading the full model.") from e
+
+    with safe_open(shard_path, framework="pt", device="cpu") as f:
+        weight = f.get_tensor(tensor_key)
+
+    if weight.dim() != 2:
+        raise RuntimeError(f"embed weight must be 2D, got shape={tuple(weight.shape)} key={tensor_key}")
+
+    return weight, tensor_key
+
+
+def write_text_embeds_and_mask(
+    *,
+    text_mm: np.memmap,            # (n, L, H) float16
+    mask_mm: np.memmap,            # (n, L) uint8
+    captions: List[str],
+    tokenizer,
+    embed_weight: Optional[torch.Tensor],
+    text_embeds_mode: str,
+    text_batch_size: int,
+) -> None:
+    n = len(captions)
+    enc = tokenizer(
+        captions,
+        padding="max_length",
+        truncation=True,
+        max_length=TEXT_MAX_LEN,
+        add_special_tokens=False,
+        return_tensors="pt",
+    )
+    input_ids = enc["input_ids"].to(torch.long)              # (n,L)
+    attn = enc["attention_mask"].to(torch.uint8)             # (n,L)
+
+    mask_mm[:] = attn.cpu().numpy()
+
+    mode = (text_embeds_mode or "zero").lower()
+    if mode == "zero":
+        text_mm[:] = 0
+        return
+
+    if mode != "qwen_input_embed":
+        raise ValueError(f"Unknown text_embeds_mode={text_embeds_mode}")
+
+    if embed_weight is None:
+        raise RuntimeError("embed_weight is None but text_embeds_mode=qwen_input_embed")
+
+    # 检查 hidden 对齐
+    if int(embed_weight.shape[1]) != int(TEXT_HIDDEN):
+        raise RuntimeError(
+            f"Qwen embed hidden={int(embed_weight.shape[1])} != TEXT_HIDDEN={TEXT_HIDDEN}. "
+            f"请修改脚本顶部 TEXT_HIDDEN 或换与训练一致的模型。"
+        )
+
+    weight = embed_weight.detach().cpu()
+    if weight.dtype != torch.float16:
+        weight = weight.to(torch.float16)
+
+    bs = max(1, int(text_batch_size))
+    for st in range(0, n, bs):
+        ed = min(n, st + bs)
+        ids = input_ids[st:ed]                 # (B,L)
+        am = attn[st:ed].to(torch.float16)     # (B,L)
+        # embedding: (B,L,H)
+        emb = F.embedding(ids, weight)         # float16
+        # pad 位清零（避免后续 pooled 时被影响）
+        emb = emb * am.unsqueeze(-1)
+        text_mm[st:ed] = emb.cpu().numpy()
+
+        if (ed == n) or ((ed // bs) % 50 == 0):
+            print(f"[INFO] text_embeds write progress {ed}/{n}")
+
+
+def looks_like_all_zero_text_embeds(
+    text_embeds_path: str,
+    n: int,
+    sample_check: int = 8,
+) -> bool:
+    """
+    粗略检测 text_embeds 是否“看起来全 0”：
+    - 只抽查前 sample_check 条样本的 max(abs(.)) 是否接近 0
+    """
+    if (not text_embeds_path) or (not os.path.exists(text_embeds_path)):
+        return True
+    k = min(int(sample_check), int(n))
+    if k <= 0:
+        return True
+    mm = np.memmap(text_embeds_path, mode="r", dtype=np.float16, shape=(n, TEXT_MAX_LEN, TEXT_HIDDEN))
+    mx = float(np.max(np.abs(mm[:k])))
+    return mx < 1e-6
 
 
 # =========================================================
@@ -415,7 +613,7 @@ def build_meta_hct(
     seed: int,
     prompt_mode: str,
     fixed_prompt: str,
-    ssvtp_prefix_txt: str,  # 复用 prefix（可选）
+    ssvtp_prefix_txt: str,
 ) -> List[Dict[str, Any]]:
     import random
     rng = random.Random(seed)
@@ -436,8 +634,8 @@ def build_meta_hct(
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"HCT test.csv not found: {csv_path}")
 
-        base_dir = os.path.dirname(csv_path)       # .../data1
-        subset = os.path.basename(base_dir)        # data1/data2/data3
+        base_dir = os.path.dirname(csv_path)
+        subset = os.path.basename(base_dir)
         delim = sniff_csv_delimiter(csv_path)
 
         with open(csv_path, "r", encoding="utf-8", newline="") as f:
@@ -480,38 +678,78 @@ def build_meta_hct(
 
 
 # =========================================================
-# feature extraction (single dataset -> single yaml)
+# feature extraction
 # =========================================================
 def extract_features_one_dataset(
     *,
     items: List[Dict[str, Any]],
-    out_feature_dir: str,                 # .../features
-    meta_json_path: str,                  # .../meta_test.json (写入 dataset_info.yaml 的 meta_paths)
+    out_feature_dir: str,
+    meta_json_path: str,
     tvl_repo_path: str,
-    subtract_background: Optional[str],   # None or "background"
+    subtract_background: Optional[str],
     tactile_model: str,
     tactile_ckpt: str,
     qwen_tokenizer_name_or_path: str,
+    qwen_model_for_text_embeds: str,
+    text_embeds_mode: str,
+    text_batch_size: int,
     batch_size: int,
     overwrite: bool,
     strict_tactile_ckpt: bool,
+    embed_weight: Optional[torch.Tensor],
+    embed_tensor_key: str,
 ) -> str:
     ensure_dir(out_feature_dir)
     paths = FeaturePaths(out_feature_dir)
     ensure_dir(paths.shard_dir)
 
-    if (not overwrite) and os.path.exists(paths.dataset_info_yaml):
-        print(f"[INFO] dataset_info.yaml exists, skip extract: {paths.dataset_info_yaml}")
-        return paths.dataset_info_yaml
-
     n = len(items)
     if n <= 0:
         raise RuntimeError("No items to extract.")
 
+    # tokenizer（用于 text_mask + input_ids）
+    tokenizer = AutoTokenizer.from_pretrained(qwen_tokenizer_name_or_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.convert_ids_to_tokens(0)
+
+    # -------- 如果已有输出且 overwrite=False：优先只修复 text_embeds --------
+    if (not overwrite) and os.path.exists(paths.dataset_info_yaml):
+        need_fix_text = False
+        if (text_embeds_mode or "zero").lower() != "zero":
+            # 判断是否看起来全 0
+            if looks_like_all_zero_text_embeds(paths.text_embeds_mmap, n):
+                need_fix_text = True
+
+        if not need_fix_text:
+            print(f"[INFO] dataset_info.yaml exists and text_embeds looks non-zero -> skip: {paths.dataset_info_yaml}")
+            return paths.dataset_info_yaml
+
+        print(f"[WARN] dataset exists but text_embeds looks all-zero -> rewrite text_embeds/text_mask only: {out_feature_dir}")
+
+        # 以 r+ 打开 text mmaps 进行覆盖写
+        text_mm = np.memmap(paths.text_embeds_mmap, mode="r+", dtype=np.float16, shape=(n, TEXT_MAX_LEN, TEXT_HIDDEN))
+        mask_mm = np.memmap(paths.text_mask_mmap, mode="r+", dtype=np.uint8, shape=(n, TEXT_MAX_LEN))
+
+        captions = [str(it.get("caption", "")) for it in items]
+        write_text_embeds_and_mask(
+            text_mm=text_mm,
+            mask_mm=mask_mm,
+            captions=captions,
+            tokenizer=tokenizer,
+            embed_weight=embed_weight,
+            text_embeds_mode=text_embeds_mode,
+            text_batch_size=text_batch_size,
+        )
+        text_mm.flush()
+        mask_mm.flush()
+        print(f"[INFO] text rewrite done. dataset_info.yaml kept: {paths.dataset_info_yaml}")
+        return paths.dataset_info_yaml
+
+    # -------- 需要全量重建（overwrite=True 或第一次生成）--------
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] extracting features: out={out_feature_dir} device={device} n={n}")
+    print(f"[INFO] text_embeds_mode={text_embeds_mode} qwen_model_for_text_embeds={qwen_model_for_text_embeds} embed_key={embed_tensor_key}")
 
-    # preprocessor
     pre_cfg = TVLTouchPreprocessConfig(
         tvl_repo_path=tvl_repo_path,
         crop_tacvis=False,
@@ -523,7 +761,6 @@ def extract_features_one_dataset(
     )
     pre = TVLTouchPreprocessor(pre_cfg)
 
-    # tactile encoder
     tac_enc = FrozenTVLTactileEncoder(
         tactile_model=tactile_model,
         checkpoint_path=tactile_ckpt,
@@ -531,11 +768,6 @@ def extract_features_one_dataset(
         l2_normalize=True,
         strict_load=strict_tactile_ckpt,
     )
-
-    # tokenizer (only for text_mask)
-    tokenizer = AutoTokenizer.from_pretrained(qwen_tokenizer_name_or_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token or tokenizer.convert_ids_to_tokens(0)
 
     # memmaps
     touch_mm = np.memmap(paths.touch_tokens_mmap, mode="w+", dtype=np.float16, shape=(n, TOUCH_NUM_TOKENS, TOUCH_HIDDEN))
@@ -545,29 +777,26 @@ def extract_features_one_dataset(
     gidx_mm = np.memmap(paths.global_indices_mmap, mode="w+", dtype=np.int64, shape=(n,))
     valid_mm = np.memmap(paths.valid_mmap, mode="w+", dtype=np.uint8, shape=(n,))
 
-    # text_embeds 全0（避免泄漏）
-    text_mm[:] = 0
-
-    # text_mask 来自 caption tokenizer attention_mask（max_len=24）
-    captions = [str(it.get("caption", "")) for it in items]
-    enc = tokenizer(
-        captions,
-        padding="max_length",
-        truncation=True,
-        max_length=TEXT_MAX_LEN,
-        add_special_tokens=False,
-        return_tensors="pt",
-    )
-    mask_mm[:] = enc["attention_mask"].to(torch.uint8).cpu().numpy()
-
-    # ids / indices
+    # 写入 sample_id / global_index
     for i, it in enumerate(items):
         sid = short_sample_id(str(it.get("id", "")))
         gidx = int(it.get("global_index", i))
         sid_mm[i] = np.bytes_(sid.encode("utf-8")[:64])
         gidx_mm[i] = gidx
 
-    # tactile -> tokens batching
+    # -------- 写 text_embeds + mask（✅不再全 0）--------
+    captions = [str(it.get("caption", "")) for it in items]
+    write_text_embeds_and_mask(
+        text_mm=text_mm,
+        mask_mm=mask_mm,
+        captions=captions,
+        tokenizer=tokenizer,
+        embed_weight=embed_weight,
+        text_embeds_mode=text_embeds_mode,
+        text_batch_size=text_batch_size,
+    )
+
+    # -------- tactile -> tokens batching --------
     t0 = time.time()
     ok = 0
     pending_tensors: List[torch.Tensor] = []
@@ -599,7 +828,7 @@ def extract_features_one_dataset(
             if not tac_path or (not os.path.isfile(tac_path)):
                 raise FileNotFoundError(f"tactile missing: {tac_path}")
             if bg_path and (not os.path.isfile(bg_path)):
-                bg_path = ""  # bg 不强制
+                bg_path = ""
 
             dataset_hint = pre.infer_dataset_hint(tac_path, bg_path)
             tactile = pre.load_tactile(
@@ -624,7 +853,7 @@ def extract_features_one_dataset(
         if (i + 1) % 50 == 0 or (i + 1) == n:
             flush_batch()
             elapsed = time.time() - t0
-            print(f"[INFO] progress {i+1}/{n} ok={ok} elapsed={elapsed:.1f}s")
+            print(f"[INFO] tactile progress {i+1}/{n} ok={ok} elapsed={elapsed:.1f}s")
 
     flush_batch()
 
@@ -652,6 +881,11 @@ def extract_features_one_dataset(
             "checkpoint_path": tactile_ckpt,
             "out_dim": TOUCH_HIDDEN,
             "l2_normalize": True,
+        },
+        "text_encoder": {
+            "mode": text_embeds_mode,
+            "qwen_model_for_text_embeds": qwen_model_for_text_embeds,
+            "tensor_key": embed_tensor_key,
         },
         "paths": {
             "touch_tokens": paths.touch_tokens_mmap,
@@ -702,7 +936,7 @@ def parse_args():
 
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
-    ap.add_argument("--overwrite", action="store_true", default=False)
+    ap.add_argument("--overwrite", action="store_true", default=True)
 
     ap.add_argument("--ssvtp_dir", type=str, default=DEFAULT_SSVTP_DIR)
     ap.add_argument("--ssvtp_test_csv", type=str, default=DEFAULT_SSVTP_TEST_CSV)
@@ -717,6 +951,11 @@ def parse_args():
     ap.add_argument("--strict_tactile_ckpt", action="store_true", default=False)
 
     ap.add_argument("--qwen_tokenizer", type=str, default=DEFAULT_QWEN_TOKENIZER)
+
+    # ✅ 新增：text embeds 相关参数
+    ap.add_argument("--text_embeds_mode", type=str, default=DEFAULT_TEXT_EMBEDS_MODE, choices=["zero", "qwen_input_embed"])
+    ap.add_argument("--qwen_model_for_text_embeds", type=str, default=DEFAULT_QWEN_MODEL_FOR_TEXT_EMBEDS)
+    ap.add_argument("--text_batch_size", type=int, default=DEFAULT_TEXT_BATCH_SIZE)
 
     ap.add_argument("--ssvtp_prompt_mode", type=str, default=DEFAULT_SSVTP_PROMPT_MODE, choices=["random_prefix", "fixed"])
     ap.add_argument("--hct_prompt_mode", type=str, default=DEFAULT_HCT_PROMPT_MODE, choices=["fixed", "random_prefix"])
@@ -733,6 +972,19 @@ def main():
         raise ValueError("Need at least one of --include_ssvtp / --include_hct")
 
     subtract_bg = None if args.subtract_background == "none" else "background"
+
+    # ✅ 如果要生成 text_embeds：提前加载 embed_tokens.weight（一次加载，供 ssvtp/hct 共用）
+    embed_weight: Optional[torch.Tensor] = None
+    embed_key: str = ""
+    if (args.text_embeds_mode or "zero").lower() != "zero":
+        print(f"[INFO] loading Qwen input embedding weight from: {args.qwen_model_for_text_embeds}")
+        embed_weight, embed_key = load_qwen_input_embed_weight(args.qwen_model_for_text_embeds)
+        print(f"[INFO] loaded embed_weight shape={tuple(embed_weight.shape)} key={embed_key}")
+        if int(embed_weight.shape[1]) != int(TEXT_HIDDEN):
+            raise RuntimeError(
+                f"embed hidden={int(embed_weight.shape[1])} != TEXT_HIDDEN={TEXT_HIDDEN}. "
+                f"请修改脚本顶部 TEXT_HIDDEN 或更换与训练一致的模型。"
+            )
 
     # ---------------- SSVTP ----------------
     if args.include_ssvtp:
@@ -762,13 +1014,18 @@ def main():
             out_feature_dir=feat_dir,
             meta_json_path=meta_json,
             tvl_repo_path=args.tvl_repo_path,
-            subtract_background=None,  # SSVTP 没 bg，固定 None 更合理
+            subtract_background=None,  # SSVTP 没 bg
             tactile_model=args.tactile_model,
             tactile_ckpt=args.tactile_ckpt,
             qwen_tokenizer_name_or_path=args.qwen_tokenizer,
+            qwen_model_for_text_embeds=args.qwen_model_for_text_embeds,
+            text_embeds_mode=args.text_embeds_mode,
+            text_batch_size=int(args.text_batch_size),
             batch_size=int(args.batch_size),
             overwrite=bool(args.overwrite),
             strict_tactile_ckpt=bool(args.strict_tactile_ckpt),
+            embed_weight=embed_weight,
+            embed_tensor_key=embed_key,
         )
         print(f"[INFO] SSVTP features yaml: {yaml_path}")
 
@@ -799,13 +1056,18 @@ def main():
             out_feature_dir=feat_dir,
             meta_json_path=meta_json,
             tvl_repo_path=args.tvl_repo_path,
-            subtract_background=subtract_bg,  # HCT 才考虑 bgsub
+            subtract_background=subtract_bg,
             tactile_model=args.tactile_model,
             tactile_ckpt=args.tactile_ckpt,
             qwen_tokenizer_name_or_path=args.qwen_tokenizer,
+            qwen_model_for_text_embeds=args.qwen_model_for_text_embeds,
+            text_embeds_mode=args.text_embeds_mode,
+            text_batch_size=int(args.text_batch_size),
             batch_size=int(args.batch_size),
             overwrite=bool(args.overwrite),
             strict_tactile_ckpt=bool(args.strict_tactile_ckpt),
+            embed_weight=embed_weight,
+            embed_tensor_key=embed_key,
         )
         print(f"[INFO] HCT features yaml: {yaml_path}")
 
