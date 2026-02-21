@@ -17,7 +17,7 @@ export MASTER_PORT=${MASTER_PORT:-$((29500 + RANDOM % 1000))}
 echo "Using MASTER_PORT=$MASTER_PORT"
 
 # 3) 运行你的训练
-export MM_CFG="/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/tvl/stage1/configs/extract_tvl_features.yaml"
+export MM_CFG="/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/image-touch/stage1/configs/extract_tvl_features.yaml"
 
-torchrun --master_port "$MASTER_PORT" --nproc_per_node=8 -m swift.tvl.stage1.src.preprocess.extract_tvl_features
+torchrun --master_port "$MASTER_PORT" --nproc_per_node=8 -m swift.image-touch.stage1.src.preprocess.extract_tvl_features
 

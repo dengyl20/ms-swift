@@ -24,7 +24,7 @@ dataset:
   max_samples: -1
 
 runtime:
-  output_dir: '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/tvl_features_stage1'
+  output_dir: '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/touch_image_features_stage1'
   overwrite: True
 
   batch_size: 8
@@ -47,6 +47,24 @@ encoders:
     l2_normalize: true
     input_dtype: 'fp32'
 
+  qwen:
+    model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    trust_remote_code: true
+    image_audio_weight_cache: "/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/swift/image-touch/stage1/cache/qwen_image_audio_weights.pt"
+    cache_dtype: "fp16"
+    compute_dtype: "fp16"
+    # 关键：不要再 .to(device)，让 HF 自己分配
+    device_map: "auto"
+    dtype: "fp16"
+
+    # token 数（最终会 pad/trunc 到固定长度写入 mmap）
+    image_tokens: 256
+    audio_tokens: 128
+
+    # ROCm/HIP 通常建议用 sdpa；如果你确定 flash_attention_2 可用再改
+    attn_implementation: "sdpa"
+    max_audio_seconds: 10     # 可选：强烈建议加，显著降低 audio 计算量
+    processor_use_fast: true  # 可选
 
   image:
     # 与 stage1 一致：冻结图像 backbone 抽 token
