@@ -1,21 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 1) 建议使用本地临时盘缓存 MIOpen DB
 BASE="${SLURM_TMPDIR:-/tmp}/${USER}/miopen_${SLURM_JOB_ID:-$$}"
-mkdir -p "${BASE}/db"
+mkdir -p "${BASE}/db" "${BASE}/logs"
 
-# 2) 让 MIOpen 的 SQLite User DB 写到本地临时目录
 export MIOPEN_USER_DB_PATH="${BASE}/db"
 export MIOPEN_DEBUG_DISABLE_SQL_WAL=1
 export MIOPEN_DISABLE_CACHE=1
 
-CONFIG=${1:-swift/point_cloud/stage1/configs/extract_tvl_features.yaml}
-NPROC=${NPROC_PER_NODE:-8}
-USE_TORCHRUN=${USE_TORCHRUN:-0}
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE="/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/logs/tvl/stage1_yan/train_${TS}.txt"
+mkdir -p "$(dirname "${LOG_FILE}")"
 
-if [[ "${USE_TORCHRUN}" == "1" ]]; then
-  MM_CFG="${CONFIG}" torchrun --standalone --nproc_per_node="${NPROC}" -m swift.point_cloud.stage1.src.preprocess.extract_tvl_features
-else
-  MM_CFG="${CONFIG}" python -m swift.point_cloud.stage1.src.preprocess.extract_tvl_features
-fi
+echo "BASE=${BASE}"
+echo "LOG_FILE=${LOG_FILE}"
+
+script -qfc 'torchrun --standalone --nproc_per_node=8 -m swift.tvl.stage1.train_touch' /dev/null | tee -a "${LOG_FILE}"

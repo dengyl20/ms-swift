@@ -2,10 +2,8 @@ seed: 1234
 
 dataset:
   meta_paths:
-    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/ssvtp/finetune.json'
-    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/hct/data1/finetune.json'
-    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/hct/data2/finetune.json'
-    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/hct/data3/finetune.json'
+    - '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/dataset/TVL/Touch-Vision-Language-Dataset/tvl_dataset/finetune_merged.json'
+
 
   # 不同 TVL 子数据集字段可能不同，按优先级匹配
   touch_key_candidates: ['tactile']
@@ -26,8 +24,8 @@ dataset:
   max_samples: -1
 
 runtime:
-  output_dir: '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/ms-swift/tvl_features_stage1'
-  overwrite: False
+  output_dir: '/vast/users/guangyi.chen/causal_group/yunlong.deng/Multimodal/tvl_features_stage1'
+  overwrite: True
 
   batch_size: 8
   num_workers: 4
